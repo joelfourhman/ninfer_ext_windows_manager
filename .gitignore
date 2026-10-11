@@ -1,0 +1,17 @@
+# Runtime state and secrets
+config/
+logs/
+models/
+source/
+temp/
+
+# PowerShell and editor artifacts
+*.log
+*.tmp
+*.bak
+.vscode/
+.idea/
+
+# Windows metadata
+Thumbs.db
+Desktop.ini
