@@ -1,5 +1,0 @@
-**
-!gateway/
-!gateway/server.py
-!deployment/
-!deployment/Dockerfile.gateway

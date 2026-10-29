@@ -1,12 +1,12 @@
 # NInfer Windows Manager
 
-Run **Qwen3.8-27B locally on an RTX 5090**, with upstream [NInfer](https://github.com/Neroued/ninfer), Qwen as an optional long-context model in Hermes, and authenticated HTTPS for trusted LAN or private-VPN clients.
+**Qwen on Windows, with simple PowerShell controls.**
 
-The PowerShell manager downloads and verifies the model, builds a pinned Linux runtime inside Docker Desktop, starts inference, and manages client API keys. Your original NInfer-Ext deployment remains available for rollback.
+Install NInfer, download the model, and start your local API from one manager. Docker Desktop provides the GPU runtime. Downloads and manager files stay in a single private `.ninfer` folder. Docker keeps its own images and TLS storage.
 
-## Clone and run
+## Get started
 
-Prerequisites: Windows 11 x64, PowerShell 7.2+, Git, Docker Desktop with WSL2/Linux containers, an RTX 5090 with a working NVIDIA driver, 64GB RAM recommended, and at least 60GiB free plus Docker build-cache space. See [installation](docs/installation.md) for first-time setup and reboot recovery.
+You need Windows 11, PowerShell 7.2+, Git, Docker Desktop with WSL2/Linux containers, and an NVIDIA driver. This build targets the **RTX 5090 with 32 GB VRAM**; 64 GB system RAM is recommended. Allow at least 60 GB free for the first installation.
 
 ```powershell
 git clone https://github.com/joelfourhman/ninfer_windows_manager.git
@@ -14,70 +14,82 @@ cd ninfer_windows_manager
 .\ninfer-manager.cmd
 ```
 
-Choose **Install / Start**. The first run downloads about 22GiB of model weights and builds CUDA code. Interrupted downloads resume; verified existing weights and images are reused. There is no Python environment to configure on Windows for the server.
+Choose **1 — Start / Install**.
 
-For automation:
+The first installation downloads about 22 GiB and builds NInfer. Interrupted downloads resume and the model is verified before use. Later starts reuse the installed files.
 
-```powershell
-.\ninfer-manager.cmd -Action Install -NonInteractive
-.\ninfer-manager.cmd -Action Status
-```
+## Everyday use
 
-Success includes `PASS authenticated model discovery and inference`. The local endpoint is `http://127.0.0.1:8080/v1`; it requires an API key. Installation alone does not open a LAN port.
+The menu handles the usual controls. Commands work too:
 
-## Connect Hermes
-
-Keep ChatGPT as your default Hermes model and add Qwen to the same profile. Enable HTTPS first, then run:
-
-```powershell
-.\ninfer-manager.cmd -Action ExportHermes -ClientName qwen
-```
-
-The manager backs up your existing settings, adds **Qwen (NInfer)** to the model picker, and stores a dedicated API key and provider-specific certificate trust. Your ChatGPT default and conversations are preserved. No separate profile is created.
-
-Start Hermes normally for ChatGPT. Select Qwen from Desktop's model button, or launch a Qwen terminal session:
-
-```powershell
-hermes chat --provider qwen --model qwen3.8-27b
-```
-
-The project launcher `.\hermes-qwen.cmd` uses the same default profile. Qwen has a **262,144-token total window**, starts compaction at **75% of its available input budget**, and uses an **8,192-token default output budget**. ChatGPT keeps its default compaction policy; there is no shared absolute token cap. Follow [the Hermes guide](docs/hermes-qwen.md) for switching, verification, and compaction behavior.
-
-## Encrypted access from another device
-
-Use your server's actual LAN address and the smallest trusted IP/subnet:
-
-```powershell
-.\ninfer-manager.cmd -Action EnableLan -LanAddress 192.168.50.115 -TrustedRemoteAddress 192.168.50.0/24
-```
-
-After installing Hermes on the client, configure its own key and public certificate.
-
-Windows requests Administrator approval for a scoped firewall rule. The HTTPS endpoint is `https://192.168.50.115:8443/v1`. Install/trust the exported public CA certificate on the client, or configure that client's certificate bundle. Each client needs its own API key. **Do not disable certificate verification.** See [network and HTTPS](docs/network-and-https.md).
-
-## Daily commands
-
-| Task | Command arguments after `.\ninfer-manager.cmd` |
+| Task | Command |
 |---|---|
-| Start / stop | `-Action Start` / `-Action Stop` |
-| Inspect / diagnose | `-Action Status` / `-Action Diagnostics` |
-| Follow engine and gateway logs | `-Action Logs` |
-| List client key metadata | `-Action ListKeys` |
-| Create a key, shown once | `-Action CreateKey -ClientName workstation` |
-| Revoke a key | `-Action RevokeKey -KeyId <id>` |
-| Benchmark actual token counts | `-Action Benchmark` |
-| Restore preserved NInfer-Ext | `-Action Rollback` |
+| Start | `.\ninfer-manager.cmd -Action Start` |
+| Stop | `.\ninfer-manager.cmd -Action Stop` |
+| Restart | `.\ninfer-manager.cmd -Action Restart` |
+| Status | `.\ninfer-manager.cmd -Action Status` |
+| Logs | `.\ninfer-manager.cmd -Action Logs` |
+| Run checks | `.\ninfer-manager.cmd -Action SelfTest` |
 
-## Documentation
+Docker Desktop must be running. Containers restart with Docker unless you deliberately stopped them.
 
-- [Installation and prerequisites](docs/installation.md)
-- [Migration and rollback](docs/migration.md)
-- [Hermes model switching and compaction](docs/hermes-qwen.md)
-- [LAN/private VPN and HTTPS](docs/network-and-https.md)
-- [API key lifecycle and secret storage](docs/api-keys.md)
-- [Operations, updates, backups, and removal](docs/operations.md)
-- [Troubleshooting](docs/troubleshooting.md)
-- [Validation and measured limits](docs/validation.md)
-- [Code review and recovery checks](docs/review.md)
+## Connect a client
 
-Runtime state, secrets, model weights, and Hermes configuration are excluded from Git. This is a trusted single-owner service; separate device keys do not provide multi-tenant isolation. The manager serves inference; Hermes supplies tools and conversation management.
+| Setting | Value |
+|---|---|
+| API base URL | `http://127.0.0.1:8080/v1` |
+| Model | `qwen3.8-27b` |
+| Context window | **262,144 tokens** |
+| Default response budget | **8,192 tokens** |
+| Authentication | API key |
+
+Copy your key without printing it:
+
+```powershell
+.\ninfer-manager.cmd -Action CopyKey
+```
+
+Use a client that supports the OpenAI-compatible Chat Completions API. Your client controls compaction; a **75% threshold** leaves roughly 64K tokens of working room before the full context window.
+
+## Optional HTTPS
+
+Use an IPv4 address assigned to your PC:
+
+```powershell
+.\ninfer-manager.cmd -Action EnableHttps -Address 192.168.50.115
+```
+
+Your encrypted API will be `https://192.168.50.115:8443/v1`. The manager keeps the same model and API keys.
+
+The public certificate is saved to `.ninfer/root-ca.crt`. Trust that certificate on connecting devices. For a DNS name, add `-ServerName qwen.home.arpa` and point that name at your PC.
+
+To return to local access only:
+
+```powershell
+.\ninfer-manager.cmd -Action DisableHttps
+```
+
+## Keys
+
+Create a separate key for another device:
+
+```powershell
+.\ninfer-manager.cmd -Action NewKey -Name laptop
+.\ninfer-manager.cmd -Action Keys
+```
+
+The new key is shown once. You can copy an existing key with `-Action CopyKey -KeyId laptop-XXXXXXXX`, or revoke it with `-Action RevokeKey -KeyId laptop-XXXXXXXX`. Use the ID returned by the manager.
+
+Keys are protected by your Windows account. Access changes reload Caddy without restarting the model.
+
+## Your files
+
+The project is one script, one launcher, and this README. Settings, keys, model files, downloads, and backups live under `.ninfer`, which is excluded from Git. Keep that folder private and retain it when updating the manager.
+
+A previous deployment is kept for recovery when available:
+
+```powershell
+.\ninfer-manager.cmd -Action Rollback
+```
+
+The manager uses a pinned [upstream NInfer](https://github.com/Neroued/ninfer) build with NVFP4 weights, K8V4 context storage, MTP5, and one active inference lane.

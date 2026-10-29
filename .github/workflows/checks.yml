@@ -1,31 +1,19 @@
-name: Manager checks
+name: Windows checks
 on:
   push:
   pull_request:
 permissions:
   contents: read
 jobs:
-  contracts:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+  check:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: '3.11'
-      - name: HTTP boundary behavior
-        run: python -m unittest discover -s tests -v
-      - name: Manager runtime generation and key lifecycle
+      - name: Native PowerShell checks
         shell: pwsh
-        run: |
-          ./tests/manager.ps1
-          ./tests/recovery.ps1
-      - name: Compile Python tooling
-        run: python -m py_compile gateway/server.py tools/validate_live.py tools/validate_hermes.py
+        run: ./ninfer-manager.ps1 -Action SelfTest
       - name: Check whitespace
+        shell: pwsh
         run: git diff --check

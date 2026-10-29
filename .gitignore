@@ -1,28 +1,10 @@
-# Runtime state and secrets
-config/
-logs/
-models/
-source/
-temp/
-__pycache__/
-*.pyc
-.pytest_cache/
-
-# PowerShell and editor artifacts
-*.log
-*.tmp
-*.bak
-.vscode/
-.idea/
-
-# Windows metadata
-Thumbs.db
-Desktop.ini
-
-# Credentials must remain local even outside generated state folders
+.ninfer/
 .env
 .env.*
-!.env.example
 *.key
 *.pfx
 *.p12
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
