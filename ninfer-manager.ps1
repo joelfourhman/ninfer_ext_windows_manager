@@ -299,7 +299,7 @@ function Export-Hermes {
   foreach($name in $tracked){
    try {
     if($existed[$name]){Copy-Item -LiteralPath (Join-Path $backup $name) -Destination (Join-Path $destination $name) -Force}
-    elseif(Test-Path -LiteralPath (Join-Path $destination $name)){Remove-Item -LiteralPath (Join-Path $destination $name)}
+    elseif(Test-Path -LiteralPath (Join-Path $destination $name)){Remove-Item -LiteralPath (Join-Path $destination $name) -Force}
    }catch{Write-Warning "Restore $name manually from $backup; automatic restoration failed."}
   }
   if($key){try{Revoke-ClientKey $key.id}catch{Write-Warning "Revoke the failed setup's key $($key.id) manually."}}

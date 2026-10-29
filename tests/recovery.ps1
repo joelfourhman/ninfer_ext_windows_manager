@@ -15,7 +15,11 @@ Write-Json $script:SettingsFile @{modelArtifact='test.ninfer';runtime=@{maxConte
 Write-Json $script:KeysFile @{clients=@()}
 function Assert($Condition,$Message){if(-not $Condition){throw $Message}}
 function Protect-Directory($Path){}
-function Protect-SecretFile($Path){$script:BeforeProtection=[IO.File]::ReadAllText($Path)}
+$script:MarkHidden=$false
+function Protect-SecretFile($Path){
+ $script:BeforeProtection=[IO.File]::ReadAllText($Path)
+ if($script:MarkHidden -and $IsWindows){[IO.File]::SetAttributes($Path,([IO.File]::GetAttributes($Path) -bor [IO.FileAttributes]::Hidden))}
+}
 function Get-HermesCommand {'fixture-hermes'}
 function Export-Certificate($Destination){[IO.File]::WriteAllText($Destination,'new-public-ca')}
 $script:Calls=[Collections.Generic.List[object]]::new();$script:FailHermes=$false
@@ -65,6 +69,7 @@ try {
  $keys=Read-Json $script:KeysFile
  Assert (-not $keys.clients[0].revokedUtc -and [bool]$keys.clients[-1].revokedUtc) 'Failure revoked the wrong client key.'
  # A home with no prior key or certificate must not retain failed setup files.
+ $script:MarkHidden=$true
  $OutputDirectory=Join-Path $fixture 'hermes-new';[void][IO.Directory]::CreateDirectory($OutputDirectory)
  [IO.File]::WriteAllText((Join-Path $OutputDirectory 'config.yaml'),$originalConfig)
  try{Export-Hermes}catch{}

@@ -6,7 +6,7 @@ The reviewed version keeps ChatGPT as the saved Hermes default and exposes Qwen 
 
 | Finding | Correction | Evidence |
 |---|---|---|
-| Failed Hermes setup could retain newly created files or overwrite its previous CA | Snapshot config, environment, key ID, and certificate; restore existing files and remove new ones; revoke only the failed key | `tests/recovery.ps1` exercises existing and absent files and checks the original key remains valid |
+| Failed Hermes setup could retain newly created files or overwrite its previous CA | Snapshot config, environment, key ID, and certificate; restore existing files and remove new ones, including hidden `.env` files; revoke only the failed key | `tests/recovery.ps1` exercises existing and absent files and checks the original key remains valid |
 | A sticky named profile could redirect setup away from the intended home | Every config mutation explicitly uses `--profile default` under the selected home | Recovery tests inspect the invoked target and verify the caller environment is restored |
 | Rebuilding a mutable gateway tag could invalidate a runtime snapshot | Derive its image name from gateway source, Dockerfile, and pinned Python identity; build before interrupting services | Recovery tests prove source changes produce a distinct image name |
 | A stale upstream snapshot could prevent recovery of a running legacy deployment | Restore whichever deployment was running before the attempt; leave key revocations untouched | Recovery tests cover running/stopped legacy state and a failed build |
