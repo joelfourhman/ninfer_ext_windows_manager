@@ -1,126 +1,83 @@
-# NInfer-Ext Windows Manager
+# NInfer Windows Manager
 
-A PowerShell manager for installing and operating
-[`giveen/ninfer-ext`](https://github.com/giveen/ninfer-ext) on Windows 11 with
-Docker Desktop, WSL2, and an NVIDIA GeForce RTX 5090.
+Run **Qwen3.8-27B locally on an RTX 5090**, with upstream [NInfer](https://github.com/Neroued/ninfer), Qwen as an optional long-context model in Hermes, and authenticated HTTPS for trusted LAN or private-VPN clients.
 
-The manager downloads and verifies the configured model, checks GPU passthrough,
-builds an immutable Docker image from a pinned upstream commit, starts an
-authenticated local API, validates inference, and supports updates with rollback.
+The PowerShell manager downloads and verifies the model, builds a pinned Linux runtime inside Docker Desktop, starts inference, and manages client API keys. Your original NInfer-Ext deployment remains available for rollback.
 
-## Requirements
+## Clone and run
 
-- 64-bit Windows 11, build 22000 or newer
-- PowerShell 7 (`pwsh`)
-- Git
-- WSL2
-- Docker Desktop using Linux containers
-- NVIDIA GeForce RTX 5090 with working Docker GPU passthrough
-- At least 48 GiB system RAM; 64 GiB or more is recommended
-- At least 55 GiB free disk space for the model, source, image, and build cache
-- Internet access to GitHub and Hugging Face during installation
-
-Install PowerShell 7 if needed:
+Prerequisites: Windows 11 x64, PowerShell 7.2+, Git, Docker Desktop with WSL2/Linux containers, an RTX 5090 with a working NVIDIA driver, 64GB RAM recommended, and at least 60GiB free plus Docker build-cache space. See [installation](docs/installation.md) for first-time setup and reboot recovery.
 
 ```powershell
-winget install --id Microsoft.PowerShell --exact
-```
-
-## Run the manager
-
-The easiest option is the launcher, which applies execution-policy bypass only
-to the child PowerShell process used for this run:
-
-```powershell
+git clone https://github.com/joelfourhman/ninfer_windows_manager.git
+cd ninfer_windows_manager
 .\ninfer-manager.cmd
 ```
 
-Select **Install / Start** from the menu. The first installation downloads a
-large model and compiles the CUDA application, so it can take a while.
+Choose **Install / Start**. The first run downloads about 22GiB of model weights and builds CUDA code. Interrupted downloads resume; verified existing weights and images are reused. There is no Python environment to configure on Windows for the server.
 
-### Run the PowerShell script directly
-
-If Windows blocks `.ps1` files, set the execution policy for the **current
-PowerShell process only**, then run the script:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-.\ninfer-manager.ps1
-```
-
-`-Scope Process` is temporary: it affects only the current PowerShell window and
-is discarded when that process exits. It does not change the policy for the
-current user or the computer. The `Set-ExecutionPolicy` command only changes the
-current process policy; it does not launch the manager by itself.
-
-You can also apply the same temporary policy and launch the script in one command:
-
-```powershell
-pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\ninfer-manager.ps1
-```
-
-## Non-interactive commands
-
-Pass an action through the CMD launcher when scripting:
+For automation:
 
 ```powershell
 .\ninfer-manager.cmd -Action Install -NonInteractive
-.\ninfer-manager.cmd -Action Status -NonInteractive
-.\ninfer-manager.cmd -Action Diagnostics -NonInteractive
-.\ninfer-manager.cmd -Action Stop -NonInteractive
-.\ninfer-manager.cmd -Action Start -NonInteractive
+.\ninfer-manager.cmd -Action Status
 ```
 
-Supported actions include `Install`, `Start`, `Stop`, `Restart`, `Status`,
-`CheckUpdates`, `Update`, `Rebuild`, `Logs`, `Diagnostics`, `Repair`,
-`ModelSettings`, `PerformanceSettings`, `NetworkSettings`, `ResetDefaults`,
-`ShowKey`, `RotateKey`, `Firewall`, `StressTest`, `SelfTest`, and `Uninstall`.
+Success includes `PASS authenticated model discovery and inference`. The local endpoint is `http://127.0.0.1:8080/v1`; it requires an API key. Installation alone does not open a LAN port.
 
-## Default deployment
+## Connect Hermes
 
-The default profile uses:
-
-- Qwen3.8 27B NVFP4 model artifact with pinned revision, size, and SHA-256
-- 262,144-token configured context
-- FP8 KV cache with KV streaming and dynamically sized host KV memory
-- One concurrent request
-- Five-token fixed MTP drafting with LM-head drafting
-- Local-only binding at `http://127.0.0.1:8080/v1`
-- Generated bearer-token authentication
-- Docker restart policy `unless-stopped`
-
-Use **Show / Rotate Key** to display or replace the API key. Treat that key as a
-secret. LAN access is disabled by default and requires an explicit network and
-restricted firewall configuration.
-
-## Files created at runtime
-
-Runtime data stays beside the manager and is intentionally excluded from Git:
-
-- `config/` — settings, deployment state, and the API key
-- `models/` — downloaded model artifacts and checksum markers
-- `source/` — the managed upstream source checkout
-- `logs/` — manager logs
-- `temp/` — generated build files
-
-Docker images and the `ninfer-ext` container remain managed by Docker Desktop.
-The one-time GPU check may retain an `nvidia/cuda` base image for reuse.
-
-## Troubleshooting
-
-Run diagnostics from the menu or directly:
+Keep ChatGPT as your default Hermes model and add Qwen to the same profile. Enable HTTPS first, then run:
 
 ```powershell
-.\ninfer-manager.cmd -Action Diagnostics -NonInteractive
+.\ninfer-manager.cmd -Action ExportHermes -ClientName qwen
 ```
 
-Useful Docker checks:
+The manager backs up your existing settings, adds **Qwen (NInfer)** to the model picker, and stores a dedicated API key and provider-specific certificate trust. Your ChatGPT default and conversations are preserved. No separate profile is created.
+
+Start Hermes normally for ChatGPT. Select Qwen from Desktop's model button, or launch a Qwen terminal session:
 
 ```powershell
-docker ps --filter name=ninfer-ext
-docker logs --tail 100 ninfer-ext
-docker system df
+hermes chat --provider qwen --model qwen3.8-27b
 ```
 
-Do not commit anything from `config/`: `config/secrets.json` contains the bearer
-token that grants access to the inference server.
+The project launcher `.\hermes-qwen.cmd` uses the same default profile. Qwen has a **262,144-token total window**, starts compaction at **75% of its available input budget**, and uses an **8,192-token default output budget**. ChatGPT keeps its default compaction policy; there is no shared absolute token cap. Follow [the Hermes guide](docs/hermes-qwen.md) for switching, verification, and compaction behavior.
+
+## Encrypted access from another device
+
+Use your server's actual LAN address and the smallest trusted IP/subnet:
+
+```powershell
+.\ninfer-manager.cmd -Action EnableLan -LanAddress 192.168.50.115 -TrustedRemoteAddress 192.168.50.0/24
+```
+
+After installing Hermes on the client, configure its own key and public certificate.
+
+Windows requests Administrator approval for a scoped firewall rule. The HTTPS endpoint is `https://192.168.50.115:8443/v1`. Install/trust the exported public CA certificate on the client, or configure that client's certificate bundle. Each client needs its own API key. **Do not disable certificate verification.** See [network and HTTPS](docs/network-and-https.md).
+
+## Daily commands
+
+| Task | Command arguments after `.\ninfer-manager.cmd` |
+|---|---|
+| Start / stop | `-Action Start` / `-Action Stop` |
+| Inspect / diagnose | `-Action Status` / `-Action Diagnostics` |
+| Follow engine and gateway logs | `-Action Logs` |
+| List client key metadata | `-Action ListKeys` |
+| Create a key, shown once | `-Action CreateKey -ClientName workstation` |
+| Revoke a key | `-Action RevokeKey -KeyId <id>` |
+| Benchmark actual token counts | `-Action Benchmark` |
+| Restore preserved NInfer-Ext | `-Action Rollback` |
+
+## Documentation
+
+- [Installation and prerequisites](docs/installation.md)
+- [Migration and rollback](docs/migration.md)
+- [Hermes model switching and compaction](docs/hermes-qwen.md)
+- [LAN/private VPN and HTTPS](docs/network-and-https.md)
+- [API key lifecycle and secret storage](docs/api-keys.md)
+- [Operations, updates, backups, and removal](docs/operations.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Validation and measured limits](docs/validation.md)
+- [Code review and recovery checks](docs/review.md)
+
+Runtime state, secrets, model weights, and Hermes configuration are excluded from Git. This is a trusted single-owner service; separate device keys do not provide multi-tenant isolation. The manager serves inference; Hermes supplies tools and conversation management.

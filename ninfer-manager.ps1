@@ -1,606 +1,464 @@
-#requires -Version 5.1
-<#
-.SYNOPSIS
-  Installs and manages giveen/ninfer-ext on Windows 11 with Docker Desktop/WSL2.
-.DESCRIPTION
-  All persistent data is rooted beside this script. The default profile is deliberately strict:
-  262144 context, FP8 KV, KV streaming, one active request, and fixed five-token MTP drafting.
-  Run without parameters for the interactive menu, or use -Action <name> for automation.
+#requires -Version 7.2
+<# .SYNOPSIS
+Install and operate upstream NInfer with a private Hermes qwen API on Windows.
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu','Install','Start','Stop','Restart','Status','CheckUpdates','Update','Rebuild',
-        'Logs','Diagnostics','Repair','ModelSettings','PerformanceSettings','NetworkSettings',
-        'ResetDefaults','ShowKey','RotateKey','Firewall','StressTest','SelfTest','Uninstall')]
-    [string]$Action = 'Menu',
-    [switch]$NonInteractive,
-    [switch]$Yes,
-    [string]$TrustedRemoteAddress,
-    [int]$StressTokens = 250000
+ [ValidateSet('Menu','Install','Start','Stop','Restart','Status','CheckUpdates','Update','Rebuild','Logs','Diagnostics','Repair','EnableLan','DisableLan','CreateKey','ListKeys','RevokeKey','RotateKey','ExportHermes','ExportCertificate','TrustCertificate','Benchmark','ValidateQwen','VerifyRollback','SelfTest','Rollback','Uninstall')][string]$Action='Menu',
+ [switch]$NonInteractive,[switch]$Yes,[string]$LanAddress,[string]$HostName,[string]$TrustedRemoteAddress,
+ [ValidatePattern('^[a-zA-Z0-9_-]{1,64}$')][string]$ClientName='qwen',
+ [string]$KeyId,[ValidateRange(0,3650)][int]$ExpiresDays=0,[string]$OutputDirectory,
+ [string]$BenchmarkContexts='2048,32768,131000,248000',
+ [ValidateRange(16,16384)][int]$BenchmarkOutputTokens=256,[ValidateRange(1,5)][int]$BenchmarkRuns=1
 )
-
 Set-StrictMode -Version 3.0
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
+$ErrorActionPreference='Stop'
+$script:Root=[IO.Path]::GetFullPath($PSScriptRoot)
+$script:State=Join-Path $script:Root 'config/manager'
+$script:Runtime=Join-Path $script:State 'runtime'
+$script:Models=Join-Path $script:Root 'models'
+$script:Source=Join-Path $script:Root 'source/ninfer'
+$script:Lock=Get-Content (Join-Path $script:Root 'deployment/runtime.lock.json') -Raw | ConvertFrom-Json
+$script:Owner='ninfer-windows-manager-v2'
+$script:Project='ninfer-windows-manager'
+$script:Compose=Join-Path $script:Runtime 'compose.json'
+$script:SettingsFile=Join-Path $script:State 'settings.json'
+$script:KeysFile=Join-Path $script:Runtime 'clients.json'
+$script:EngineImage='ninfer-manager:'+$script:Lock.upstreamCommit.Substring(0,12)
+$script:Firewall='NInfer Windows Manager HTTPS'
 
-$script:ManagerVersion = '1.0.0'
-$script:ManagerId = 'ninfer-ext-windows-manager-v1'
-$script:Root = [IO.Path]::GetFullPath($PSScriptRoot)
-$script:Models = Join-Path $script:Root 'models'
-$script:SourceRoot = Join-Path $script:Root 'source'
-$script:Source = Join-Path $script:SourceRoot 'ninfer-ext'
-$script:Config = Join-Path $script:Root 'config'
-$script:Logs = Join-Path $script:Root 'logs'
-$script:Temp = Join-Path $script:Root 'temp'
-$script:SettingsPath = Join-Path $script:Config 'settings.json'
-$script:DeploymentPath = Join-Path $script:Config 'deployment.json'
-$script:SecretsPath = Join-Path $script:Config 'secrets.json'
-$script:LogPath = Join-Path $script:Logs ('manager-{0}.jsonl' -f (Get-Date -Format 'yyyyMMdd'))
-$script:ContainerName = 'ninfer-ext'
-$script:ImageRepository = 'ninfer-ext-manager'
-$script:FirewallRule = 'NInfer-Ext Manager LAN'
-$script:SourceUrl = 'https://github.com/giveen/ninfer-ext.git'
-$script:CudaImageVersion = '13.3.1'
-$script:CudaUbuntu = 'ubuntu26.04'
-$script:ModelDefaults = [ordered]@{
-    repository = 'neroued/Qwen3.8-27B-nvfp4-NInfer'
-    revision = 'a107ba1b5b0609d9ca90d5ed61439f5f5cc7d64d'
-    artifact = 'qwen3_8_27b_nvfp4.ninfer'
-    modelId = 'qwen3.8-27b'
-    bytes = [int64]23719715844
-    sha256 = '74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82'
-    maxPositionEmbeddings = 262144
-    fullAttentionLayers = 16
-    kvHeads = 4
-    headDimension = 256
-    mtpLayers = 1
-    minimumRuntimeCommit = '98dada0e03cb073fd07f905400b5904bc6e82759'
+function Write-Json($Path,$Value) {
+ $temporary="$Path.$PID.tmp"
+ [IO.File]::WriteAllText($temporary,($Value | ConvertTo-Json -Depth 30),[Text.UTF8Encoding]::new($false))
+ Move-Item -LiteralPath $temporary -Destination $Path -Force
 }
-
-function Test-Interactive { return (-not $NonInteractive) -and [Environment]::UserInteractive }
-function Write-Color([string]$Text, [ConsoleColor]$Color = [ConsoleColor]::Gray) {
-    if ($Host.UI.SupportsVirtualTerminal -or $Host.Name -match 'ConsoleHost') { Write-Host $Text -ForegroundColor $Color }
-    else { Write-Host $Text }
+function Read-Json($Path) { Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json }
+function Protect-Directory($Path) {
+ $account=[Security.Principal.WindowsIdentity]::GetCurrent().Name
+ & icacls.exe $Path /inheritance:r /grant:r "${account}:(OI)(CI)F" 'SYSTEM:(OI)(CI)F' | Out-Null
+ if($LASTEXITCODE -ne 0){throw "Could not restrict access to $Path"}
 }
-function Protect-Text([string]$Text) {
-    if (-not $Text) { return $Text }
-    if (Test-Path -LiteralPath $script:SecretsPath) {
-        try {
-            $key = (Get-Content -LiteralPath $script:SecretsPath -Raw | ConvertFrom-Json).apiKey
-            if ($key) { $Text = $Text.Replace([string]$key, '<redacted>') }
-        } catch {}
-    }
-    return $Text
+function New-Token { 'nwm_'+[Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant() }
+function Get-Digest([string]$Value) { [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Value))).ToLowerInvariant() }
+function Get-Settings { Read-Json $script:SettingsFile }
+function Get-Policy { [ordered]@{contextLength=262144;compressionTriggerPercent=75;compressionTriggerTokens=196608;recommendedInputCeiling=229376;defaultOutputTokens=8192;maxOutputTokens=16384;summaryMaxTokens=8192;targetAfterCompression=65536;compaction='Hermes client';profile='qwen';model='qwen3.8-27b'} }
+function Get-GatewayImage {
+ $identity=$script:Lock.python+"`n"+[IO.File]::ReadAllText((Join-Path $script:Root 'deployment/Dockerfile.gateway')).Replace("`r`n","`n")+"`n"+[IO.File]::ReadAllText((Join-Path $script:Root 'gateway/server.py')).Replace("`r`n","`n")
+ 'ninfer-manager-gateway:'+(Get-Digest $identity).Substring(0,16)
 }
-function Write-Log([string]$Level, [string]$Message, [hashtable]$Data = @{}) {
-    $safe = Protect-Text $Message
-    $entry = [ordered]@{ timestamp = (Get-Date).ToUniversalTime().ToString('o'); level = $Level; message = $safe; data = $Data }
-    try { Add-Content -LiteralPath $script:LogPath -Value ($entry | ConvertTo-Json -Compress -Depth 8) -Encoding utf8 } catch {}
-    if ($Level -eq 'ERROR') { Write-Color $safe Red }
-    elseif ($Level -eq 'WARN') { Write-Color $safe Yellow }
-    elseif ($Level -eq 'INFO') { Write-Host $safe }
+function Build-Gateway {
+ $image=Get-GatewayImage;$existing=Get-DockerJson @('image','inspect',$image)
+ if($existing){if($existing[0].Config.Labels.'com.ninfer-manager.owner' -ne $script:Owner){throw 'Gateway image ownership mismatch.'};return}
+ Invoke-External docker @('build','--build-arg',"PYTHON_IMAGE=$($script:Lock.python)",'--label',"com.ninfer-manager.owner=$script:Owner",'-f',(Join-Path $script:Root 'deployment/Dockerfile.gateway'),'-t',$image,$script:Root)
 }
-function Confirm-Choice([string]$Prompt, [bool]$Default = $false) {
-    if ($Yes) { return $true }
-    if (-not (Test-Interactive)) { return $false }
-    $suffix = if ($Default) { '[Y/n]' } else { '[y/N]' }
-    $answer = Read-Host "$Prompt $suffix"
-    if (-not $answer) { return $Default }
-    return $answer -match '^(y|yes)$'
+function Protect-SecretFile($Path) {
+ $user=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+ Invoke-External icacls @($Path,'/inheritance:r','/grant:r',"*$($user):(F)",'*S-1-5-18:(F)')
 }
-function New-Directories {
-    foreach ($path in @($script:Models,$script:SourceRoot,$script:Config,$script:Logs,$script:Temp)) {
-        [void][IO.Directory]::CreateDirectory($path)
-    }
+function Initialize-Manager {
+ foreach($path in @($script:State,$script:Runtime,$script:Models,(Join-Path $script:Root 'logs'),(Join-Path $script:Root 'temp'))){[void][IO.Directory]::CreateDirectory($path)}
+ Protect-Directory (Join-Path $script:Root 'config')
+ if(-not(Test-Path $script:SettingsFile)) { Write-Json $script:SettingsFile ([ordered]@{schemaVersion=2;network=@{enabled=$false;address='';hostname='';trustedSubnet='';httpsPort=8443;localPort=8080};runtime=@{maxContext=262144;kvDtype='k8v4';hostCapacity='8GiB';draftTokens=5;memoryHeadroom='512MiB'};modelArtifact='qwen3_8_27b_nvfp4.v3.ninfer'}) }
+ if(-not(Test-Path $script:KeysFile)){Write-Json $script:KeysFile @{schemaVersion=1;clients=@()}}
+ foreach($file in @('backend-secret.txt','admin-secret.txt')){if(-not(Test-Path (Join-Path $script:State $file))){[IO.File]::WriteAllText((Join-Path $script:State $file),(New-Token))}}
+ $keys=Read-Json $script:KeysFile
+ if(-not(@($keys.clients | Where-Object id -eq 'manager-local').Count)){
+  $keys.clients=@($keys.clients)+@([pscustomobject]@{id='manager-local';name='manager-local';sha256=(Get-Digest ([IO.File]::ReadAllText((Join-Path $script:State 'admin-secret.txt'))));createdUtc=[datetime]::UtcNow.ToString('o');expiresUtc=$null;revokedUtc=$null})
+  Write-Json $script:KeysFile $keys
+ }
 }
-function Write-JsonAtomic([string]$Path, $Value) {
-    $tmp = "$Path.$PID.tmp"
-    $json = $Value | ConvertTo-Json -Depth 20
-    [IO.File]::WriteAllText($tmp, $json, [Text.UTF8Encoding]::new($false))
-    Move-Item -LiteralPath $tmp -Destination $Path -Force
+function Invoke-External([string]$File,[string[]]$Arguments) { & $File @Arguments; if($LASTEXITCODE -ne 0){throw "$File failed (exit $LASTEXITCODE). See output above."} }
+function Get-DockerJson([string[]]$Arguments) { $output=& docker @Arguments 2>$null; if($LASTEXITCODE -ne 0){return $null}; ($output -join "`n") | ConvertFrom-Json -NoEnumerate }
+function Invoke-Compose([string[]]$Arguments) { Invoke-External docker (@('compose','--project-name',$script:Project,'--file',$script:Compose)+$Arguments) }
+function Assert-Owned($Container) { $info=Get-DockerJson @('inspect',$Container); if($info -and $info[0].Config.Labels.'com.ninfer-manager.owner' -ne $script:Owner){throw "Container $Container is not owned by this manager."} }
+function Test-Prerequisites {
+ if(-not[OperatingSystem]::IsWindows()){throw 'Windows 11 and PowerShell 7.2+ are required.'}
+ foreach($command in @('git','docker','curl.exe')){if(-not(Get-Command $command -ErrorAction SilentlyContinue)){throw "$command is missing. See docs/installation.md."}}
+ $dockerType=& docker info --format '{{.OSType}}' 2>$null
+ if($LASTEXITCODE -ne 0 -or $dockerType -ne 'linux'){throw 'Start Docker Desktop using WSL2/Linux containers, then run Install again.'}
+ Invoke-External docker @('compose','version','--short')
+ $gpu=& nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+ if($LASTEXITCODE -ne 0 -or $gpu -notmatch 'RTX 5090'){throw 'The tested qwen profile requires an RTX 5090 (32GB).'}
+ if(([IO.DriveInfo]::new([IO.Path]::GetPathRoot($script:Root))).AvailableFreeSpace -lt 60GB){throw 'Allow at least 60 GiB free for model migration and Docker builds, plus build-cache space.'}
+ $os=Get-CimInstance Win32_OperatingSystem
+ if([int64]$os.TotalVisibleMemorySize -lt 48GB/1KB){throw 'At least 48 GiB RAM is required; 64 GiB is the tested target.'}
 }
-function Read-Json([string]$Path, $Default) {
-    if (-not (Test-Path -LiteralPath $Path)) { return $Default }
-    try { return Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json }
-    catch { throw "Invalid JSON in $Path. Restore or remove that file and retry. $($_.Exception.Message)" }
+function Sync-Upstream {
+ if(-not(Test-Path (Join-Path $script:Source '.git'))){Invoke-External git @('clone',$script:Lock.upstreamUrl,$script:Source)}
+ $remote=& git -C $script:Source remote get-url origin
+ if($remote.TrimEnd('/') -ne $script:Lock.upstreamUrl.TrimEnd('/')){throw 'Managed source has an unexpected origin.'}
+ if((& git -C $script:Source status --porcelain)){throw 'Managed upstream source has local edits. Preserve them before installing.'}
+ & git -C $script:Source cat-file -e "$($script:Lock.upstreamCommit)^{commit}" 2>$null
+ if($LASTEXITCODE -ne 0){Invoke-External git @('-C',$script:Source,'fetch','origin',$script:Lock.upstreamCommit)}
+ Invoke-External git @('-C',$script:Source,'checkout','--detach',$script:Lock.upstreamCommit)
 }
-function Get-RandomKey {
-    $bytes = [byte[]]::new(36)
-    [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-    return 'ninf_' + [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','-').Replace('/','_')
-}
-function Protect-SecretsFile {
-    if (-not (Test-Path -LiteralPath $script:SecretsPath)) { return }
-    if ([Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([Runtime.InteropServices.OSPlatform]::Windows)) {
-        $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        # Full control for the creating user is needed for atomic replacement/key rotation; inheritance is removed.
-        & icacls.exe $script:SecretsPath '/inheritance:r' '/grant:r' "${user}:(F)" '/c' | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Log WARN 'Could not restrict secrets.json ACL. Restrict it manually before enabling LAN access.' }
-    }
-}
-function Get-MemoryInfo {
-    try {
-        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
-        return [pscustomobject]@{ TotalMiB=[math]::Floor([double]$os.TotalVisibleMemorySize/1024); AvailableMiB=[math]::Floor([double]$os.FreePhysicalMemory/1024) }
-    } catch {
-        Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
-        $ci = [Microsoft.VisualBasic.Devices.ComputerInfo]::new()
-        return [pscustomobject]@{ TotalMiB=[math]::Floor($ci.TotalPhysicalMemory/1MB); AvailableMiB=[math]::Floor($ci.AvailablePhysicalMemory/1MB) }
-    }
-}
-function Get-DefaultHostKvMiB {
-    param([int64]$TotalMiB, [int64]$AvailableMiB, [int64]$Context = 262144)
-    # 16 full-attention layers + one MTP layer, 4 KV heads, d=256, K+V, one byte FP8.
-    $bytesPerToken = ($script:ModelDefaults.fullAttentionLayers + $script:ModelDefaults.mtpLayers) *
-        $script:ModelDefaults.kvHeads * $script:ModelDefaults.headDimension * 2
-    $worstCaseMiB = [math]::Ceiling(($Context * $bytesPerToken) / 1MB)
-    $desiredMiB = [math]::Ceiling($worstCaseMiB * 1.10)
-    $osReserve = [math]::Max(16384, [math]::Ceiling($TotalMiB * 0.25))
-    $dynamicReserve = [math]::Max($osReserve, $TotalMiB - $AvailableMiB + 8192)
-    $safeNow = [math]::Max(1024, $TotalMiB - $dynamicReserve)
-    return [int][math]::Max(1024, [math]::Min($desiredMiB, $safeNow))
-}
-function New-DefaultSettings {
-    $memory = Get-MemoryInfo
-    $model = [ordered]@{}
-    foreach ($key in $script:ModelDefaults.Keys) { $model[$key] = $script:ModelDefaults[$key] }
-    return [ordered]@{
-        schemaVersion = 1
-        model = $model
-        runtime = [ordered]@{
-            maxContext = 262144; kvCapacity = 'auto'; maxConcurrency = 1; kvDtype = 'fp8'
-            kvStream = $true; hostKvMiB = (Get-DefaultHostKvMiB $memory.TotalMiB $memory.AvailableMiB)
-            hostCacheMiB = 0; spec = 'mtp'; draftTokens = 5; fixedDraft = $true; lmHeadDraft = $true
-        }
-        network = [ordered]@{ port = 8080; lanEnabled = $false; trustedRemoteAddress = ''; restartPolicy = 'unless-stopped' }
-        memory = [ordered]@{ reserveMiB = [math]::Max(16384, [math]::Ceiling($memory.TotalMiB * 0.25)); lastCalculatedUtc = (Get-Date).ToUniversalTime().ToString('o') }
-    }
-}
-function Initialize-State {
-    New-Directories
-    if (-not (Test-Path -LiteralPath $script:SettingsPath)) { Write-JsonAtomic $script:SettingsPath (New-DefaultSettings) }
-    if (-not (Test-Path -LiteralPath $script:DeploymentPath)) {
-        Write-JsonAtomic $script:DeploymentPath ([ordered]@{ schemaVersion=1; activeCommit=''; lastBuiltCommit=''; lastKnownGoodImage=''; modelRevision=''; configHash=''; empiricallyValidatedContext=0; lastUpdateCheckUtc=''; firewallRule='' })
-    }
-    if (-not (Test-Path -LiteralPath $script:SecretsPath)) {
-        Write-JsonAtomic $script:SecretsPath ([ordered]@{ schemaVersion=1; apiKey=(Get-RandomKey); createdUtc=(Get-Date).ToUniversalTime().ToString('o') })
-    }
-    Protect-SecretsFile
-}
-function Assert-PowerShell7 {
-    if ($PSVersionTable.PSVersion.Major -ge 7) { return }
-    $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
-    if (-not $pwsh) {
-        Write-Color 'PowerShell 7 is required. Install it with: winget install --id Microsoft.PowerShell --exact' Yellow
-        if ((Test-Interactive) -and (Get-Command winget.exe -ErrorAction SilentlyContinue) -and (Confirm-Choice 'Install PowerShell 7 now?')) {
-            & winget.exe install --id Microsoft.PowerShell --exact --source winget --accept-package-agreements --accept-source-agreements
-            Write-Host 'Installation finished. Re-run this script in PowerShell 7.'
-        }
-        exit 10
-    }
-    $args = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,'-Action',$Action)
-    if ($NonInteractive) { $args += '-NonInteractive' }; if ($Yes) { $args += '-Yes' }
-    if ($TrustedRemoteAddress) { $args += @('-TrustedRemoteAddress',$TrustedRemoteAddress) }
-    & $pwsh.Source @args
-    exit $LASTEXITCODE
-}
-function Invoke-Process {
-    param([Parameter(Mandatory)][string]$File, [string[]]$Arguments=@(), [switch]$AllowFailure, [switch]$Live, [int]$TimeoutSeconds=0)
-    $display = Protect-Text (($File + ' ' + (($Arguments | ForEach-Object { if ($_ -match '\s') { '"'+$_+'"' } else { $_ } }) -join ' ')).Trim())
-    Write-Log DEBUG $display
-    $psi = [Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = $File; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
-    $psi.RedirectStandardOutput = -not $Live; $psi.RedirectStandardError = -not $Live
-    foreach ($arg in $Arguments) { [void]$psi.ArgumentList.Add([string]$arg) }
-    $p = [Diagnostics.Process]::new(); $p.StartInfo = $psi
-    if (-not $p.Start()) { throw "Could not start $File" }
-    if (-not $Live) { $stdoutTask=$p.StandardOutput.ReadToEndAsync(); $stderrTask=$p.StandardError.ReadToEndAsync() }
-    if ($TimeoutSeconds -gt 0 -and -not $p.WaitForExit($TimeoutSeconds * 1000)) { try { $p.Kill($true) } catch {}; throw "$File timed out after $TimeoutSeconds seconds." }
-    $p.WaitForExit()
-    $stdout=if($Live){''}else{$stdoutTask.GetAwaiter().GetResult().TrimEnd()};$stderr=if($Live){''}else{$stderrTask.GetAwaiter().GetResult().TrimEnd()}
-    $result = [pscustomobject]@{ ExitCode=$p.ExitCode; StdOut=$stdout; StdErr=$stderr; Command=$display }
-    if ($p.ExitCode -ne 0 -and -not $AllowFailure) {
-        $detail=if($Live){'See the external command output immediately above.'}else{Protect-Text $result.StdErr}
-        throw "$File failed with exit code $($p.ExitCode): $detail"
-    }
-    return $result
-}
-function Get-CommandPath([string]$Name) { $c=Get-Command $Name -ErrorAction SilentlyContinue; if ($c) { return $c.Source }; return $null }
-function Get-ContainerInfo {
-    if (-not (Get-CommandPath docker)) { return $null }
-    $r=Invoke-Process docker @('inspect',$script:ContainerName,'--format','{{json .}}') -AllowFailure
-    if ($r.ExitCode -ne 0) { return $null }
-    return $r.StdOut | ConvertFrom-Json
-}
-function Assert-OwnedContainer($Info) {
-    if (-not $Info) { return }
-    if ($Info.Config.Labels.'com.ninfer-manager.owner' -ne $script:ManagerId) { throw "Container '$($script:ContainerName)' exists but is not owned by this manager. Rename or remove it yourself." }
-}
-function Get-Settings { return Read-Json $script:SettingsPath $null }
-function Get-Deployment { return Read-Json $script:DeploymentPath $null }
-function Get-Secrets { return Read-Json $script:SecretsPath $null }
-function Get-ConfigHash($Settings) {
-    $secretFingerprint=''
-    if(Test-Path -LiteralPath $script:SecretsPath){$secretFingerprint=(Get-Secrets).apiKey}
-    $json = ($Settings | ConvertTo-Json -Depth 20 -Compress) + "`n" + $secretFingerprint
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try { return ([Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($json)))).ToLowerInvariant() } finally { $sha.Dispose() }
-}
-function Assert-DefaultProfile($Settings) {
-    $r=$Settings.runtime; $fail=@()
-    if ([int]$r.maxContext -ne 262144) {$fail+='--max-context 262144'}; if ([string]$r.kvCapacity -ne 'auto') {$fail+='--kv-capacity auto'}
-    if ([int]$r.maxConcurrency -ne 1) {$fail+='--max-concurrency 1'}; if ([string]$r.kvDtype -ne 'fp8') {$fail+='--kv-dtype fp8'}
-    if (-not $r.kvStream) {$fail+='--kv-stream'}; if ([int]$r.hostKvMiB -le 0) {$fail+='--host-kv-mib positive'}
-    if ([string]$r.spec -ne 'mtp') {$fail+='--spec mtp'}; if ([int]$r.draftTokens -ne 5) {$fail+='--draft-tokens 5'}
-    if (-not $r.fixedDraft) {$fail+='--fixed-draft'}; if (-not $r.lmHeadDraft) {$fail+='--lm-head-draft'}
-    return ,$fail
-}
-function Test-PortAvailable([int]$Port) {
-    $listeners = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue
-    return -not $listeners
-}
-function Get-Hardware {
-    $mem=Get-MemoryInfo; $gpuName='Not detected'; $vram=0; $driver=''
-    if (Get-CommandPath nvidia-smi) {
-        $r=Invoke-Process nvidia-smi @('--query-gpu=name,memory.total,driver_version','--format=csv,noheader,nounits') -AllowFailure
-        if ($r.ExitCode -eq 0 -and $r.StdOut) { $p=($r.StdOut -split "`n")[0] -split ','; $gpuName=$p[0].Trim(); $vram=[int]([double]$p[1].Trim()); $driver=$p[2].Trim() }
-    }
-    $drive=[IO.DriveInfo]::new([IO.Path]::GetPathRoot($script:Root))
-    return [pscustomobject]@{ GPU=$gpuName; VramMiB=$vram; Driver=$driver; TotalRamMiB=$mem.TotalMiB; AvailableRamMiB=$mem.AvailableMiB; FreeDiskGiB=[math]::Round($drive.AvailableFreeSpace/1GB,1) }
-}
-function Test-Prerequisites([switch]$ForInstall, [switch]$GpuSmoke) {
-    $issues=[Collections.Generic.List[string]]::new(); $h=Get-Hardware
-    if (-not [Environment]::Is64BitOperatingSystem) { $issues.Add('64-bit Windows is required.') }
-    $build=[Environment]::OSVersion.Version.Build; if ($build -lt 22000) { $issues.Add("Windows 11 build 22000+ is required; detected build $build.") }
-    if (-not (Get-CommandPath git)) { $issues.Add('Git is missing (winget install --id Git.Git --exact).') }
-    $wsl=Get-CommandPath wsl.exe
-    if(-not$wsl){$issues.Add('WSL2 is missing (run wsl --install from an Administrator terminal, then reboot).')}
-    else{$ws=Invoke-Process $wsl @('--status') -AllowFailure -TimeoutSeconds 20;if($ws.ExitCode-ne0){$issues.Add('WSL is installed but unhealthy. Run wsl --update and wsl --shutdown, then restart Docker Desktop.')}}
-    if (-not (Get-CommandPath docker)) { $issues.Add('Docker Desktop CLI is missing (winget install --id Docker.DockerDesktop --exact).') }
-    else {
-        $d=Invoke-Process docker @('info','--format','{{.OSType}}') -AllowFailure -TimeoutSeconds 20
-        if ($d.ExitCode -ne 0) { $issues.Add('Docker daemon is unavailable. Start Docker Desktop and wait until it is ready.') }
-        elseif ($d.StdOut.Trim() -ne 'linux') { $issues.Add('Docker Desktop must use Linux containers.') }
-        elseif ($GpuSmoke) {
-            Write-Host 'Running Docker GPU smoke test (the CUDA image may download once)...'
-            $g=Invoke-Process docker @('run','--rm','--gpus','all',"nvidia/cuda:$($script:CudaImageVersion)-base-$($script:CudaUbuntu)",'nvidia-smi','-L') -AllowFailure -TimeoutSeconds 300
-            if($g.StdOut){Write-Host $g.StdOut};if($g.StdErr){Write-Host $g.StdErr}
-            if ($g.ExitCode -ne 0 -or $g.StdOut -notmatch 'GPU') { $issues.Add('Docker NVIDIA GPU passthrough smoke test failed. Update the NVIDIA driver and Docker Desktop/WSL2 integration.') }
-        }
-    }
-    if ($h.GPU -notmatch 'RTX 5090') { $issues.Add("NInfer-Ext currently supports only RTX 5090 (sm_120a); detected: $($h.GPU).") }
-    if ($ForInstall -and $h.FreeDiskGiB -lt 55) { $issues.Add("At least 55 GiB free is required for source, build layers, and the 22.09 GiB model; only $($h.FreeDiskGiB) GiB is free.") }
-    if ($ForInstall -and $h.TotalRamMiB -lt 49152) { $issues.Add('At least 48 GiB system RAM is required for this long-context profile; 64 GiB or more is recommended.') }
-    if($ForInstall){$configured=(Get-Settings).runtime.hostKvMiB;if($h.AvailableRamMiB-lt([int]$configured+8192)){$issues.Add("Available RAM is too low for the configured Host KV plus 8 GiB working headroom: $($h.AvailableRamMiB) MiB available, $configured MiB Host KV.")}}
-    if($ForInstall){foreach($url in @('https://github.com','https://huggingface.co')){try{$null=Invoke-WebRequest -Uri $url -Method Head -TimeoutSec 15 -UseBasicParsing}catch{$issues.Add("Network check failed for ${url}: $($_.Exception.Message)")}}}
-    return [pscustomobject]@{ Ok=($issues.Count -eq 0); Issues=$issues; Hardware=$h }
-}
-function Invoke-PrerequisiteRepair {
-    if(-not(Test-Interactive)){return}
-    $winget=Get-CommandPath winget.exe
-    if(-not(Get-CommandPath git)-and$winget-and(Confirm-Choice 'Install Git using Winget?')){Invoke-Process $winget @('install','--id','Git.Git','--exact','--source','winget','--accept-package-agreements','--accept-source-agreements') -Live|Out-Null}
-    if(-not(Get-CommandPath docker)-and$winget-and(Confirm-Choice 'Install Docker Desktop using Winget?')){Invoke-Process $winget @('install','--id','Docker.DockerDesktop','--exact','--source','winget','--accept-package-agreements','--accept-source-agreements') -Live|Out-Null;Write-Log WARN 'Docker Desktop installation may require sign-out or reboot. Re-run this script afterward.'}
-    if(-not(Get-CommandPath wsl.exe)){Write-Log WARN 'WSL2 installation changes Windows features and requires Administrator approval. Run: wsl --install, reboot, then re-run this script.'}
-    elseif(Confirm-Choice 'Run the official WSL update command?') {Invoke-Process wsl.exe @('--update') -AllowFailure -Live|Out-Null;Invoke-Process wsl.exe @('--shutdown') -AllowFailure|Out-Null}
-}
-function Get-RemoteHead {
-    $r=Invoke-Process git @('ls-remote','--symref',$script:SourceUrl,'HEAD') -AllowFailure -TimeoutSeconds 30
-    if ($r.ExitCode -ne 0) { return $null }
-    $branch=''; $sha=''
-    foreach($line in $r.StdOut -split "`n") { if ($line -match '^ref:\s+refs/heads/(\S+)\s+HEAD'){$branch=$Matches[1]} elseif($line -match '^([0-9a-f]{40})\s+HEAD'){$sha=$Matches[1]} }
-    if (-not $sha) { return $null }; return [pscustomobject]@{ Branch=$branch; Sha=$sha }
-}
-function Sync-Source([string]$Commit) {
-    if (-not (Test-Path -LiteralPath (Join-Path $script:Source '.git'))) {
-        Invoke-Process git @('clone',$script:SourceUrl,$script:Source) -Live | Out-Null
-    }
-    Invoke-Process git @('-c',"safe.directory=$($script:Source.Replace('\','/'))",'-C',$script:Source,'fetch','--prune','origin') -Live | Out-Null
-    Invoke-Process git @('-c',"safe.directory=$($script:Source.Replace('\','/'))",'-C',$script:Source,'checkout','--detach',$Commit) -Live | Out-Null
-    $actual=(Invoke-Process git @('-c',"safe.directory=$($script:Source.Replace('\','/'))",'-C',$script:Source,'rev-parse','HEAD')).StdOut.Trim()
-    if ($actual -ne $Commit) { throw "Source checkout is $actual, expected $Commit." }
-    $minimum=(Get-Settings).model.minimumRuntimeCommit
-    if($minimum){$compatible=Invoke-Process git @('-c',"safe.directory=$($script:Source.Replace('\','/'))",'-C',$script:Source,'merge-base','--is-ancestor',[string]$minimum,$Commit) -AllowFailure;if($compatible.ExitCode-ne0){throw "Selected NInfer-Ext commit $Commit does not contain the model's minimum runtime revision $minimum."}}
-}
-function Test-Model([switch]$Quiet) {
-    $s=Get-Settings; $path=Join-Path $script:Models ([string]$s.model.artifact)
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
-    $file=Get-Item -LiteralPath $path
-    if ($file.Length -ne [int64]$s.model.bytes) { if(-not $Quiet){Write-Log WARN "Model size is $($file.Length), expected $($s.model.bytes)."}; return $false }
-    $marker="$path.ready.json"; if (Test-Path -LiteralPath $marker) {
-        $m=Read-Json $marker $null
-        if ($m.sha256 -eq $s.model.sha256 -and [int64]$m.bytes -eq $file.Length -and $m.lastWriteUtc -eq $file.LastWriteTimeUtc.ToString('o')) { return $true }
-    }
-    Write-Host 'Verifying model SHA-256 (this reads 22 GiB and can take several minutes)...'
-    $hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($hash -ne $s.model.sha256) { if(-not $Quiet){Write-Log ERROR "Model SHA-256 mismatch: $hash"}; return $false }
-    Write-JsonAtomic $marker ([ordered]@{sha256=$hash;bytes=$file.Length;lastWriteUtc=$file.LastWriteTimeUtc.ToString('o');repository=$s.model.repository;revision=$s.model.revision;verifiedUtc=(Get-Date).ToUniversalTime().ToString('o')})
-    return $true
+function Build-Engine([switch]$Force) {
+ $info=Get-DockerJson @('image','inspect',$script:EngineImage)
+ if($info -and -not $Force){if($info[0].Config.Labels.'com.ninfer-manager.commit' -ne $script:Lock.upstreamCommit){throw 'Engine image provenance mismatch.'};return}
+ Sync-Upstream
+ Invoke-External docker @('build','--progress','plain','--build-context',"upstream=$script:Source",'--build-arg',"CUDA_BUILD=$($script:Lock.cudaBuild)",'--build-arg',"CUDA_RUNTIME=$($script:Lock.cudaRuntime)",'--label',"com.ninfer-manager.owner=$script:Owner",'--label',"com.ninfer-manager.commit=$($script:Lock.upstreamCommit)",'-f',(Join-Path $script:Root 'deployment/Dockerfile.ninfer'),'-t',$script:EngineImage,$script:Root)
 }
 function Install-Model {
-    if (Test-Model) { Write-Log INFO 'Existing model passed size/checksum verification; reusing it.'; return }
-    $s=Get-Settings; $final=Join-Path $script:Models ([string]$s.model.artifact); $partial="$final.partial"
-    $url="https://huggingface.co/$($s.model.repository)/resolve/$($s.model.revision)/$($s.model.artifact)?download=true"
-    Write-Host "Downloading $($s.model.artifact) (22.09 GiB). Interrupted downloads resume."
-    $curl=Get-CommandPath curl.exe
-    if (-not $curl) { throw 'curl.exe is required for resumable model downloads and is included with Windows 11.' }
-    $r=Invoke-Process $curl @('--location','--fail','--retry','8','--retry-delay','5','--continue-at','-','--output',$partial,$url) -AllowFailure -Live
-    if ($r.ExitCode -ne 0) { throw "Model download failed. The partial file was kept for resume. $($r.StdErr)" }
-    $f=Get-Item -LiteralPath $partial; if ($f.Length -ne [int64]$s.model.bytes) { throw "Downloaded size $($f.Length) does not match authoritative size $($s.model.bytes). Partial file kept." }
-    $hash=(Get-FileHash -LiteralPath $partial -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($hash -ne $s.model.sha256) { throw "Downloaded model checksum mismatch. Expected $($s.model.sha256), got $hash. Partial file kept for diagnosis." }
-    Move-Item -LiteralPath $partial -Destination $final -Force
-    $completed=Get-Item -LiteralPath $final
-    Write-JsonAtomic "$final.ready.json" ([ordered]@{sha256=$hash;bytes=$completed.Length;lastWriteUtc=$completed.LastWriteTimeUtc.ToString('o');repository=$s.model.repository;revision=$s.model.revision;verifiedUtc=(Get-Date).ToUniversalTime().ToString('o')})
-}
-function Build-Image([string]$Commit, [switch]$Force) {
-    $tag="$($script:ImageRepository):$($Commit.Substring(0,12))"
-    $existing=Invoke-Process docker @('image','inspect',$tag,'--format','{{index .Config.Labels "com.ninfer-manager.commit"}}') -AllowFailure
-    if (-not $Force -and $existing.ExitCode -eq 0 -and $existing.StdOut.Trim() -eq $Commit) { Write-Log INFO "Reusing image $tag"; return $tag }
-    $upstreamDockerfile=Join-Path $script:Source 'Dockerfile'
-    $dockerText=Get-Content -LiteralPath $upstreamDockerfile -Raw -Encoding utf8
-    $dockerfile=$upstreamDockerfile
-    # HEAD currently asks nvcc for C++23 but its checked-in CUDA 13.1 image rejects -std=c++23.
-    # Upstream's README validates CUDA 13.3, so derive only this exact, auditable base-image repair.
-    if($dockerText.Contains('nvidia/cuda:13.1.2-devel-ubuntu24.04') -and $dockerText.Contains('nvidia/cuda:13.1.2-runtime-ubuntu24.04')){
-        $derived=$dockerText.Replace('nvidia/cuda:13.1.2-devel-ubuntu24.04',"nvidia/cuda:$($script:CudaImageVersion)-devel-$($script:CudaUbuntu)").Replace('nvidia/cuda:13.1.2-runtime-ubuntu24.04',"nvidia/cuda:$($script:CudaImageVersion)-runtime-$($script:CudaUbuntu)")
-        # Keep runtime package names release-independent; the -dev packages pull the matching shared libraries.
-        $derived=$derived.Replace('libavcodec60','libavcodec-dev').Replace('libavformat60','libavformat-dev').Replace('libavutil58','libavutil-dev').Replace('libcurl4t64','libcurl4-openssl-dev').Replace('libswscale7','libswscale-dev')
-        $dockerfile=Join-Path $script:Temp "Dockerfile.$($Commit.Substring(0,12)).cuda-$($script:CudaImageVersion)"
-        [IO.File]::WriteAllText($dockerfile,$derived,[Text.UTF8Encoding]::new($false))
-        Write-Log WARN "Upstream Dockerfile pins CUDA 13.1.2, whose nvcc rejects the source's required C++23 mode. Building the unchanged source with upstream-validated CUDA $($script:CudaImageVersion)."
-    } elseif($dockerText -notmatch 'nvidia/cuda:13\.3\.[0-9]+-devel-ubuntu26\.04') {
-        throw 'Upstream Dockerfile uses an unrecognized CUDA base. Refusing to rewrite it automatically.'
-    }
-    Write-Host "Building immutable image $tag. This can take a long time on the first run."
-    Invoke-Process docker @('build','--progress','plain','--pull','--file',$dockerfile,'--label',"com.ninfer-manager.owner=$script:ManagerId",'--label',"com.ninfer-manager.commit=$Commit",'--label',"com.ninfer-manager.cuda=$($script:CudaImageVersion)",'--tag',$tag,$script:Source) -Live | Out-Null
-    $verify=Invoke-Process docker @('run','--rm','--gpus','all',$tag,'ninfer-serve','--help') -AllowFailure -TimeoutSeconds 60
-    foreach($flag in @('--max-context','--kv-stream','--host-kv-mib','--fixed-draft','--lm-head-draft','--api-key')) { if(($verify.StdOut+$verify.StdErr) -notmatch [regex]::Escape($flag)){throw "Built server does not support mandatory flag $flag at commit $Commit."} }
-    return $tag
-}
-function Get-ServeArguments($Settings, [string]$ApiKey) {
-    $r=$Settings.runtime; $m=$Settings.model
-    $a=@('ninfer-serve',('/models/'+$m.artifact),'--model-id',[string]$m.modelId,'--host','0.0.0.0','--port','8080','--api-key',$ApiKey,
-        '--max-context',[string]$r.maxContext,'--kv-capacity',[string]$r.kvCapacity,'--max-concurrency',[string]$r.maxConcurrency,
-        '--kv-dtype',[string]$r.kvDtype,'--spec',[string]$r.spec,'--draft-tokens',[string]$r.draftTokens)
-    if ($r.kvStream) {$a+='--kv-stream'}; if ([int]$r.hostKvMiB -gt 0) {$a+=@('--host-kv-mib',[string]$r.hostKvMiB)}
-    if ([int]$r.hostCacheMiB -gt 0) {$a+=@('--host-cache-mib',[string]$r.hostCacheMiB)}
-    if ($r.fixedDraft) {$a+='--fixed-draft'}; if ($r.lmHeadDraft) {$a+='--lm-head-draft'}
-    return ,$a
-}
-function Get-SanitizedInvocation($Args) {
-    $copy=[Collections.Generic.List[string]]::new(); for($i=0;$i -lt $Args.Count;$i++){ if($i -gt 0 -and $Args[$i-1] -eq '--api-key'){$copy.Add('<redacted>')}else{$copy.Add([string]$Args[$i])} }
-    return ($copy -join ' ')
-}
-function Remove-OwnedContainer {
-    $info=Get-ContainerInfo; if(-not $info){return}; Assert-OwnedContainer $info
-    Invoke-Process docker @('rm','--force',$script:ContainerName) | Out-Null
-}
-function Start-Container([string]$Image, [string]$Commit, [switch]$Replace) {
-    $s=Get-Settings; $secret=Get-Secrets; $hash=Get-ConfigHash $s; $existing=Get-ContainerInfo
-    if($existing){ Assert-OwnedContainer $existing; $same=($existing.Config.Image -eq $Image -and $existing.Config.Labels.'com.ninfer-manager.config-sha256' -eq $hash)
-        if($same -and -not $Replace){ if(-not $existing.State.Running){Invoke-Process docker @('start',$script:ContainerName)|Out-Null}; return }
-        Remove-OwnedContainer
-    }
-    if(-not (Test-PortAvailable ([int]$s.network.port))){throw "Port $($s.network.port) is already in use. Change it in Network Settings or stop the conflicting service."}
-    $bind=if($s.network.lanEnabled){'0.0.0.0'}else{'127.0.0.1'}
-    $mount="$($script:Models):/models:ro"; $serve=Get-ServeArguments $s $secret.apiKey
-    $dockerArgs=@('run','--detach','--name',$script:ContainerName,'--gpus','all','--restart',[string]$s.network.restartPolicy,
-        '--label',"com.ninfer-manager.owner=$script:ManagerId",'--label',"com.ninfer-manager.commit=$Commit",'--label',"com.ninfer-manager.config-sha256=$hash",'--label',"com.ninfer-manager.image=$Image",
-        '--publish',"${bind}:$($s.network.port):8080",'--mount',"type=bind,source=$($script:Models),target=/models,readonly",$Image)+$serve
-    Write-Host ('Launch: docker ' + (Get-SanitizedInvocation $dockerArgs))
-    Invoke-Process docker $dockerArgs | Out-Null
-}
-function Invoke-Api([string]$Path, [string]$Method='GET', $Body=$null, [int]$Timeout=30) {
-    $s=Get-Settings; $key=(Get-Secrets).apiKey; $headers=@{Authorization="Bearer $key"}
-    $params=@{Uri="http://127.0.0.1:$($s.network.port)$Path";Method=$Method;Headers=$headers;TimeoutSec=$Timeout;UseBasicParsing=$true}
-    if($null -ne $Body){$params.ContentType='application/json';$params.Body=($Body|ConvertTo-Json -Depth 10 -Compress)}
-    return Invoke-RestMethod @params
-}
-function Wait-Healthy([int]$TimeoutSeconds=1200) {
-    $s=Get-Settings; $end=(Get-Date).AddSeconds($TimeoutSeconds); $last=''
-    while((Get-Date)-lt$end){
-        $info=Get-ContainerInfo; if(-not $info -or -not $info.State.Running){$logs=(Invoke-Process docker @('logs','--tail','100',$script:ContainerName) -AllowFailure).StdErr;throw "Container stopped during startup. $logs"}
-        try{$h=Invoke-RestMethod -Uri "http://127.0.0.1:$($s.network.port)/health" -TimeoutSec 5;if($h.status -eq 'ok'){return}}catch{$last=$_.Exception.Message}
-        Write-Host -NoNewline '.'; Start-Sleep -Seconds 5
-    }
-    throw "Server did not become healthy within $TimeoutSeconds seconds. Last HTTP error: $last"
-}
-function Test-LiveInvocation([switch]$Detailed) {
-    $s=Get-Settings; $info=Get-ContainerInfo; $results=[ordered]@{}
-    if(-not $info){foreach($n in @('max-context','kv-capacity','max-concurrency','kv-dtype','kv-stream','host-kv-mib','spec','draft-tokens','fixed-draft','lm-head-draft')){$results[$n]=$false};return $results}
-    $args=@($info.Args); $pairs=[ordered]@{'max-context'='262144';'kv-capacity'='auto';'max-concurrency'='1';'kv-dtype'='fp8';'host-kv-mib'=[string]$s.runtime.hostKvMiB;'spec'='mtp';'draft-tokens'='5'}
-    foreach($k in $pairs.Keys){$i=[array]::IndexOf($args,"--$k");$results[$k]=($i-ge 0-and $i+1-lt$args.Count-and [string]$args[$i+1]-eq$pairs[$k])}
-    foreach($k in @('kv-stream','fixed-draft','lm-head-draft')){$results[$k]=($args -contains "--$k")}
-    if($Detailed){foreach($k in $results.Keys){Write-Color ("{0,-20} {1}" -f "--$k",$(if($results[$k]){'PASS'}else{'FAIL'})) $(if($results[$k]){'Green'}else{'Red'})}}
-    return $results
-}
-function Test-LiveConfiguredInvocation {
-    $s=Get-Settings;$info=Get-ContainerInfo;$results=[Collections.Generic.List[string]]::new()
-    if(-not$info){$results.Add('container missing');return ,$results};$args=@($info.Args);$r=$s.runtime
-    $pairs=[ordered]@{'max-context'=[string]$r.maxContext;'kv-capacity'=[string]$r.kvCapacity;'max-concurrency'=[string]$r.maxConcurrency;'kv-dtype'=[string]$r.kvDtype;'spec'=[string]$r.spec;'draft-tokens'=[string]$r.draftTokens}
-    if([int]$r.hostKvMiB-gt0){$pairs['host-kv-mib']=[string]$r.hostKvMiB};if([int]$r.hostCacheMiB-gt0){$pairs['host-cache-mib']=[string]$r.hostCacheMiB}
-    foreach($k in $pairs.Keys){$i=[array]::IndexOf($args,"--$k");if($i-lt0-or$i+1-ge$args.Count-or[string]$args[$i+1]-ne$pairs[$k]){$results.Add("--$k")}}
-    foreach($item in @(@('kv-stream',[bool]$r.kvStream),@('fixed-draft',[bool]$r.fixedDraft),@('lm-head-draft',[bool]$r.lmHeadDraft))){$present=$args-contains("--$($item[0])");if($present-ne$item[1]){$results.Add("--$($item[0])")}}
-    return ,$results
-}
-function Test-ApiSmoke {
-    $s=Get-Settings; $models=Invoke-Api '/v1/models'; if(-not $models.data){throw 'Authenticated /v1/models returned no model.'}
-    $body=@{model=$s.model.modelId;messages=@(@{role='user';content='Reply with exactly: READY'});max_tokens=8;temperature=0}
-    $reply=Invoke-Api '/v1/chat/completions' 'POST' $body 180
-    if(-not $reply.choices){throw 'Authenticated inference smoke test returned no choices.'}
-    return $models.data[0]
-}
-function Complete-Start([string]$Image,[string]$Commit,[switch]$Replace) {
-    Start-Container $Image $Commit -Replace:$Replace; Write-Host 'Waiting for model load' -NoNewline; Wait-Healthy; Write-Host
-    $live=Get-ContainerInfo;if($live.Config.Labels.'com.ninfer-manager.commit'-ne$Commit){throw 'Running container commit label does not match the selected source revision.'}
-    $mismatch=Test-LiveConfiguredInvocation;if($mismatch.Count){throw "Running process does not match configured flags: $($mismatch -join ', ')."}
-    $model=Test-ApiSmoke; $d=Get-Deployment; $d.activeCommit=$Commit;$d.lastBuiltCommit=$Commit;$d.lastKnownGoodImage=$Image;$d.modelRevision=(Get-Settings).model.revision;$d.configHash=Get-ConfigHash(Get-Settings);Write-JsonAtomic $script:DeploymentPath $d
-    Show-Endpoints; Write-Color "Operational: authenticated inference succeeded; configured context $($model.max_model_len)." Green
-}
-function Show-Endpoints {
-    $s=Get-Settings; Write-Host "Local API: http://127.0.0.1:$($s.network.port)/v1"
-    if($s.network.lanEnabled){$ips=Get-NetIPAddress -AddressFamily IPv4 -AddressState Preferred -ErrorAction SilentlyContinue|Where-Object{$_.IPAddress-notmatch '^(127\.|169\.254\.)' -and $_.InterfaceAlias-notmatch 'vEthernet|Loopback|VPN|Tailscale'}|Select-Object -ExpandProperty IPAddress
-        foreach($ip in $ips){Write-Host "LAN API:   http://${ip}:$($s.network.port)/v1"}}
-    Write-Host "Model:     $($s.model.modelId)"; Write-Host 'Auth:      Authorization: Bearer <key from ShowKey>'
-    Write-Host "Hermes/OpenAI base URL: http://127.0.0.1:$($s.network.port)/v1 (use the model and bearer key shown by this manager)."
-    Write-Host "Anthropic Messages URL: http://127.0.0.1:$($s.network.port)/v1/messages (x-api-key is also accepted)."
-}
-function Invoke-Install {
-    $pre=Test-Prerequisites -ForInstall -GpuSmoke; if(-not $pre.Ok){$pre.Issues|ForEach-Object{Write-Log ERROR $_};Invoke-PrerequisiteRepair;throw 'Prerequisite validation failed; no model download was started. Re-run after completing the guidance above.'}
-    $profile=Assert-DefaultProfile(Get-Settings);if($profile.Count){Write-Log WARN "Explicit nondefault performance profile active; default requirements changed: $($profile -join ', ')."}
-    $configured=Get-Settings;if([int]$configured.runtime.maxContext-gt[int]$configured.model.maxPositionEmbeddings){throw "Requested context $($configured.runtime.maxContext) exceeds verified model max_position_embeddings $($configured.model.maxPositionEmbeddings). No silent reduction will be made."}
-    $remote=Get-RemoteHead;if(-not$remote){throw 'GitHub is unreachable and no source commit can be verified for a fresh install.'}
-    Install-Model;Sync-Source $remote.Sha;$image=Build-Image $remote.Sha;Complete-Start $image $remote.Sha -Replace
-}
-function Invoke-Start {
-    $d=Get-Deployment;if(-not$d.lastKnownGoodImage){Invoke-Install;return};if(-not(Test-Model)){Install-Model}
-    Complete-Start $d.lastKnownGoodImage $d.activeCommit
-}
-function Invoke-Stop { $i=Get-ContainerInfo;if($i){Assert-OwnedContainer $i;Invoke-Process docker @('stop',$script:ContainerName)|Out-Null;Write-Log INFO 'NInfer-Ext stopped.'}else{Write-Host 'Managed container does not exist.'} }
-function Invoke-Update([switch]$ForceBuild) {
-    $d=Get-Deployment;$remote=Get-RemoteHead;if(-not$remote){throw 'GitHub could not be reached. The existing deployment was left untouched.'}
-    if(-not$ForceBuild-and$d.activeCommit-eq$remote.Sha){Write-Host 'Installed source is current; no rebuild needed.';return}
-    if(-not$ForceBuild-and-not(Confirm-Choice "Build and deploy upstream $($remote.Sha.Substring(0,12))?")){Write-Host 'Update declined.';return}
-    $oldImage=$d.lastKnownGoodImage;$oldCommit=$d.activeCommit
-    Sync-Source $remote.Sha;$newImage=Build-Image $remote.Sha -Force:$ForceBuild
-    try{Complete-Start $newImage $remote.Sha -Replace;Write-Color 'Update validated and committed.' Green}
-    catch{Write-Log ERROR "New deployment failed: $($_.Exception.Message)";Write-Log WARN 'Rolling back to the last known-good image.';Remove-OwnedContainer
-        if($oldImage){try{Complete-Start $oldImage $oldCommit -Replace;Write-Color 'Rollback succeeded.' Yellow}catch{throw "Update failed and rollback also failed: $($_.Exception.Message)"}}
-        throw 'Update failed; the previous deployment was restored.'}
-}
-function Invoke-CheckUpdates {
-    $d=Get-Deployment;$container=Get-ContainerInfo;if($container){try{Assert-OwnedContainer $container;if($container.Config.Labels.'com.ninfer-manager.commit'){$d.activeCommit=$container.Config.Labels.'com.ninfer-manager.commit'}}catch{}}
-    $remote=Get-RemoteHead;if(-not$remote){Write-Log WARN 'GitHub unavailable; the existing installation can still run.';return}
-    Write-Host "Installed SHA: $($d.activeCommit)";Write-Host "Remote SHA:    $($remote.Sha)"
-    if(-not$d.activeCommit){Write-Host 'No deployed commit is recorded. Run Install.';return}
-    if($d.activeCommit-eq$remote.Sha){Write-Color 'Up to date.' Green;return}
-    if(Test-Path(Join-Path $script:Source '.git')){Invoke-Process git @('-c',"safe.directory=$($script:Source.Replace('\','/'))",'-C',$script:Source,'fetch','origin') -AllowFailure|Out-Null
-        $anc=Invoke-Process git @('-c',"safe.directory=$($script:Source.Replace('\','/'))",'-C',$script:Source,'merge-base','--is-ancestor',$d.activeCommit,$remote.Sha) -AllowFailure
-        if($anc.ExitCode-eq 0){$count=(Invoke-Process git @('-c',"safe.directory=$($script:Source.Replace('\','/'))",'-C',$script:Source,'rev-list','--count',"$($d.activeCommit)..$($remote.Sha)")).StdOut;Write-Color "Update available: $count new commit(s)." Yellow
-            Invoke-Process git @('-c',"safe.directory=$($script:Source.Replace('\','/'))",'-C',$script:Source,'log','--oneline','--no-decorate',"$($d.activeCommit)..$($remote.Sha)",'--max-count=12') -AllowFailure -Live|Out-Null}
-        else{Write-Log WARN 'Remote HEAD differs but is not a descendant of the deployed commit (history may have diverged). Review before updating.'}}
-}
-function Show-Status {
-    $h=Get-Hardware;$s=Get-Settings;$d=Get-Deployment;$i=Get-ContainerInfo;$running=$false;$healthy=$false
-    if($i){try{Assert-OwnedContainer $i;$running=[bool]$i.State.Running}catch{}}
-    if($running){try{$x=Invoke-RestMethod -Uri "http://127.0.0.1:$($s.network.port)/health" -TimeoutSec 3;$healthy=$x.status-eq'ok'}catch{}}
-    Write-Host ('='*50);Write-Color '               NINFER-EXT MANAGER' Cyan;Write-Host ('='*50)
-    Write-Host ("GPU:          {0} ({1:N1} GiB)" -f $h.GPU,($h.VramMiB/1024));Write-Host ("System RAM:   {0:N1} GiB ({1:N1} GiB available)" -f ($h.TotalRamMiB/1024),($h.AvailableRamMiB/1024))
-    Write-Host "Model:        $($s.model.modelId)";Write-Host "Context:      $($s.runtime.maxContext) configured; $($d.empiricallyValidatedContext) empirically validated"
-    Write-Host "Container:    $(if($running){'RUNNING'}elseif($i){'STOPPED'}else{'NOT INSTALLED'})";Write-Host "API:          $(if($healthy){'HEALTHY'}else{'NOT VERIFIED'})";Write-Host "Source SHA:   $($d.activeCommit)"
-    if($healthy){Show-Endpoints};Write-Host ('-'*50)
-}
-function Invoke-Diagnostics {
-    Show-Status;$s=Get-Settings;$pre=Test-Prerequisites
-    foreach($x in $pre.Issues){Write-Color "FAIL prerequisite: $x" Red};if($pre.Ok){Write-Color 'PASS prerequisites (GPU container smoke test not rerun)' Green}
-    Write-Host 'Mandatory live flags:';[void](Test-LiveInvocation -Detailed)
-    $model=Test-Model -Quiet;Write-Color "$(if($model){'PASS'}else{'FAIL'}) model size and verified checksum marker" $(if($model){'Green'}else{'Red'})
-    $i=Get-ContainerInfo;if($i){Write-Host ('Sanitized live argv: '+(Get-SanitizedInvocation @($i.Args)));Write-Host 'Recent container logs:';Invoke-Process docker @('logs','--tail','80',$script:ContainerName) -AllowFailure -Live|Out-Null}
-    $bytesPerToken=($script:ModelDefaults.fullAttentionLayers+$script:ModelDefaults.mtpLayers)*$script:ModelDefaults.kvHeads*$script:ModelDefaults.headDimension*2
-    $fullMiB=[math]::Ceiling($s.runtime.maxContext*$bytesPerToken/1MB)
-    Write-Host "KV calculation: $bytesPerToken bytes/token; worst-case full-window FP8 KV = $fullMiB MiB before GPU-resident pages; Host KV configured = $($s.runtime.hostKvMiB) MiB."
-    Write-Host 'Configured context is not empirical proof. Use StressTest to attempt near-limit admission/generation.'
-}
-function Set-Performance {
-    $s=Get-Settings;Write-Color 'Advanced settings can make the server fail. Blank input keeps the current value.' Yellow
-    foreach($pair in @(@('maxContext','Maximum context'),@('hostKvMiB','Host KV MiB'),@('hostCacheMiB','Host cache MiB'),@('maxConcurrency','Concurrency'))){$v=Read-Host "$($pair[1]) [$($s.runtime.($pair[0]))]";if($v){$s.runtime.($pair[0])=[int]$v}}
-    $dtype=Read-Host "KV dtype [$($s.runtime.kvDtype)]";if($dtype){if($dtype-notin@('bf16','int8','fp8','nvfp4','k8v4')){throw'Invalid KV dtype'};$s.runtime.kvDtype=$dtype}
-    if([int]$s.runtime.hostCacheMiB-gt0-and[int]$s.runtime.hostKvMiB-gt0){throw '--host-cache-mib and --host-kv-mib are mutually exclusive upstream. Set one to 0.'}
-    Write-JsonAtomic $script:SettingsPath $s;Write-Host 'Saved. Restart recreates the container; no image rebuild is needed.'
-}
-function Set-Network {
-    $s=Get-Settings;$p=Read-Host "Port [$($s.network.port)]";if($p){$n=[int]$p;if($n-lt1-or$n-gt65535){throw'Invalid port'};$s.network.port=$n}
-    $lan=Read-Host "Enable authenticated LAN binding? [$($s.network.lanEnabled)] (yes/no)";if($lan){$s.network.lanEnabled=$lan-match'^(y|yes|true)$'}
-    Write-JsonAtomic $script:SettingsPath $s;Write-Host 'Saved. Restart required. LAN firewall access remains closed until Firewall is configured.'
-}
-function Set-Model {
-    Write-Color 'Changing models requires exact authoritative metadata; no silent substitution is performed.' Yellow
-    $s=Get-Settings;$repo=Read-Host "Hugging Face repository [$($s.model.repository)]";if($repo){$s.model.repository=$repo}
-    $artifact=Read-Host "Artifact filename [$($s.model.artifact)]";if($artifact){if([IO.Path]::GetFileName($artifact)-ne$artifact){throw'Artifact must be a filename only'};$s.model.artifact=$artifact}
-    $rev=Read-Host "Pinned revision SHA [$($s.model.revision)]";if($rev){if($rev-notmatch'^[0-9a-f]{40}$'){throw'Revision must be a 40-character SHA'};$s.model.revision=$rev}
-    $bytes=Read-Host "Exact bytes [$($s.model.bytes)]";if($bytes){$s.model.bytes=[int64]$bytes};$sha=Read-Host "SHA-256 [$($s.model.sha256)]";if($sha){if($sha-notmatch'^[0-9a-fA-F]{64}$'){throw'Invalid SHA-256'};$s.model.sha256=$sha.ToLowerInvariant()}
-    $id=Read-Host "Public model ID [$($s.model.modelId)]";if($id){$s.model.modelId=$id}
-    $maxPos=Read-Host "Verified max_position_embeddings [$($s.model.maxPositionEmbeddings)]";if($maxPos){$s.model.maxPositionEmbeddings=[int]$maxPos}
-    $minimum=Read-Host "Minimum compatible runtime commit [$($s.model.minimumRuntimeCommit)]";if($minimum){if($minimum-notmatch'^[0-9a-f]{40}$'){throw'Runtime commit must be a 40-character SHA'};$s.model.minimumRuntimeCommit=$minimum}
-    Write-JsonAtomic $script:SettingsPath $s;Write-Host 'Saved. The new artifact will be downloaded and the container recreated on Install.'
-}
-function Invoke-Firewall {
-    $s=Get-Settings;if(-not$s.network.lanEnabled){throw'Enable LAN access in Network Settings first.'}
-    $remote=if($TrustedRemoteAddress){$TrustedRemoteAddress}else{Read-Host 'Trusted remote IP or CIDR (example 192.168.1.0/24)'}
-    if(-not$remote-or$remote-eq'Any'){throw'A narrow trusted IP/CIDR is required; Any is refused.'}
-    if(-not(Confirm-Choice "Create/update Private-profile firewall rule for $remote on TCP $($s.network.port)?")){throw'Firewall change declined.'}
-    $admin=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if(-not$admin){throw'Re-run PowerShell as Administrator for the Firewall action only.'}
-    Remove-NetFirewallRule -DisplayName $script:FirewallRule -ErrorAction SilentlyContinue
-    New-NetFirewallRule -DisplayName $script:FirewallRule -Direction Inbound -Action Allow -Protocol TCP -LocalPort $s.network.port -Profile Private -RemoteAddress $remote|Out-Null
-    $d=Get-Deployment;$d.firewallRule=$script:FirewallRule;Write-JsonAtomic $script:DeploymentPath $d;Write-Color 'Restricted firewall rule created.' Green
-}
-function Invoke-StressTest {
-    if($StressTokens-lt1000-or$StressTokens-gt261888){throw'StressTokens must be 1000..261888, reserving output tokens within 262144.'}
-    Write-Color "This sends approximately $StressTokens simple tokens and may take many minutes and consume substantial RAM." Yellow
-    if(-not(Confirm-Choice 'Run the near-limit admission and 8-token generation test?')){return}
-    $s=Get-Settings;$text=('a ' * $StressTokens);$body=@{model=$s.model.modelId;messages=@(@{role='user';content=$text});max_tokens=8;temperature=0}
-    try{$null=Invoke-Api '/v1/chat/completions' 'POST' $body 3600;$d=Get-Deployment;$d.empiricallyValidatedContext=$StressTokens;$d.lastStressTestUtc=(Get-Date).ToUniversalTime().ToString('o');Write-JsonAtomic $script:DeploymentPath $d;Write-Color "Stress request was admitted and generated output near $StressTokens input words. Exact tokenizer count may differ." Green}
-    catch{Write-Log ERROR "Stress test was not admitted/completed: $($_.Exception.Message)";throw}
-}
-function Invoke-Repair {
-    $pre=Test-Prerequisites -GpuSmoke;if(-not$pre.Ok){$pre.Issues|ForEach-Object{Write-Log ERROR $_};throw'Repair cannot continue until prerequisites pass.'}
-    if(-not(Test-Model)){Install-Model};$d=Get-Deployment;if(-not$d.lastKnownGoodImage){Invoke-Install}else{Complete-Start $d.lastKnownGoodImage $d.activeCommit -Replace}
-}
-function Invoke-SelfTest {
-    $fail=[Collections.Generic.List[string]]::new();$mem=Get-DefaultHostKvMiB 65536 50000;if($mem-le0-or$mem-ge65536){$fail.Add('RAM budget bounds')}
-    $defaults=New-DefaultSettings;if((Assert-DefaultProfile $defaults).Count){$fail.Add('mandatory default profile')}
-    $args=Get-ServeArguments $defaults 'secret-test';$required=@('--max-context','262144','--kv-capacity','auto','--max-concurrency','1','--kv-dtype','fp8','--kv-stream','--host-kv-mib','--spec','mtp','--draft-tokens','5','--fixed-draft','--lm-head-draft')
-    foreach($x in $required){if($args-notcontains$x){$fail.Add("argv missing $x")}}
-    if((Get-SanitizedInvocation $args)-match'secret-test'){$fail.Add('secret redaction')}
-    $altered=New-DefaultSettings;$altered.runtime.maxContext=131072;if((Assert-DefaultProfile $altered)-notcontains'--max-context 262144'){$fail.Add('silent context reduction rejection')}
-    $tmp=Join-Path $script:Temp "atomic-$PID.json";Write-JsonAtomic $tmp @{unicode='✓';value=7};if((Read-Json $tmp $null).value-ne7){$fail.Add('atomic JSON')};Remove-Item -LiteralPath $tmp -Force
-    if($fail.Count){$fail|ForEach-Object{Write-Color "FAIL $_" Red};throw "$($fail.Count) self-test(s) failed."};Write-Color 'PASS internal self-tests: defaults, argv, redaction, budget bounds, atomic state.' Green
-}
-function Invoke-Uninstall {
-    Write-Color 'This removes only labeled manager container/images and its tracked firewall rule. Models are kept.' Yellow
-    if(-not(Confirm-Choice 'Continue with uninstall?')){return};Remove-OwnedContainer
-    $images=Invoke-Process docker @('images','--filter',"label=com.ninfer-manager.owner=$script:ManagerId",'--format','{{.Repository}}:{{.Tag}}') -AllowFailure
-    foreach($img in $images.StdOut -split"`n"){if($img){Invoke-Process docker @('image','rm',$img) -AllowFailure|Out-Null}}
-    $d=Get-Deployment;if($d.firewallRule){$admin=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);if($admin){Remove-NetFirewallRule -DisplayName $d.firewallRule -ErrorAction SilentlyContinue}else{Write-Log WARN "Firewall rule '$($d.firewallRule)' remains; remove it from an Administrator PowerShell."}}
-    $d.activeCommit='';$d.lastKnownGoodImage='';$d.configHash='';Write-JsonAtomic $script:DeploymentPath $d;Write-Color 'Managed Docker deployment removed. Models, settings, source, logs, and this script were preserved.' Green
-}
-function Show-Key { $k=(Get-Secrets).apiKey;Write-Host "API key: $k";Write-Host 'Keep this secret. It grants inference access.' }
-function Rotate-Key { if(-not(Confirm-Choice 'Rotate the API key? Existing clients will stop authenticating.')){return};$x=Get-Secrets;$x.apiKey=Get-RandomKey;$x.rotatedUtc=(Get-Date).ToUniversalTime().ToString('o');Write-JsonAtomic $script:SecretsPath $x;Protect-SecretsFile;Write-Host 'Key rotated. Restarting is required.' }
-function Show-Menu {
-    try{Invoke-CheckUpdates}catch{Write-Log WARN "Startup update check failed: $($_.Exception.Message). Existing deployment remains usable."}
-    while($true){
-        Show-Status
-        $menuRows=@(
-            @('[1]  Install / Start',        '[10] Performance Settings'),
-            @('[2]  Stop',                   '[11] Network Settings'),
-            @('[3]  Restart',                '[12] Repair'),
-            @('[4]  Check for Updates',      '[13] Show / Rotate Key'),
-            @('[5]  Update',                 '[14] Firewall'),
-            @('[6]  Rebuild',                '[15] Stress Test'),
-            @('[7]  View Logs',              '[16] Reset Defaults'),
-            @('[8]  Diagnostics',             '[17] Uninstall'),
-            @('[9]  Model Settings',          '[0]  Exit')
-        )
-        foreach($row in $menuRows){Write-Host ('{0,-31}{1}' -f $row[0],$row[1])}
-        $c=Read-Host 'Select an option';try{switch($c){'1'{Invoke-Install};'2'{Invoke-Stop};'3'{Invoke-Stop;Invoke-Start};'4'{Invoke-CheckUpdates};'5'{Invoke-Update};'6'{Invoke-Update -ForceBuild};'7'{Invoke-Process docker @('logs','--tail','300','--follow',$script:ContainerName) -AllowFailure -Live|Out-Null};'8'{Invoke-Diagnostics};'9'{Set-Model};'10'{Set-Performance};'11'{Set-Network};'12'{Invoke-Repair};'13'{Show-Key;if(Confirm-Choice 'Rotate it?'){Rotate-Key}};'14'{Invoke-Firewall};'15'{Invoke-StressTest};'16'{if(Confirm-Choice 'Reset all settings to the mandatory default profile?'){Write-JsonAtomic $script:SettingsPath (New-DefaultSettings)}};'17'{Invoke-Uninstall};'0'{return};default{Write-Color 'Invalid selection.' Yellow}}}catch{Write-Log ERROR $_.Exception.Message};if($c-ne'0'){Read-Host 'Press Enter to continue'|Out-Null}}
+ $model=$script:Lock.model;$input=Join-Path $script:Models $model.artifact
+ if(-not(Test-Path $input)){
+  $partial="$input.partial";$url="https://huggingface.co/$($model.repository)/resolve/$($model.revision)/$($model.artifact)?download=true"
+  Invoke-External curl.exe @('--location','--fail','--retry','5','--continue-at','-','--output',$partial,$url)
+  if((Get-Item $partial).Length -ne $model.bytes -or (Get-FileHash $partial).Hash.ToLowerInvariant() -ne $model.sha256){throw 'Model verification failed; partial download retained.'}
+  Move-Item -LiteralPath $partial -Destination $input
+ }
+ if((Get-Item $input).Length -ne $model.bytes -or (Get-FileHash $input).Hash.ToLowerInvariant() -ne $model.sha256){throw 'Original model failed verification. It was not modified.'}
+ $stream=[IO.File]::OpenRead($input)
+ try{$header=[byte[]]::new(8);$null=$stream.Read($header,0,8)}finally{$stream.Dispose()}
+ if([Text.Encoding]::ASCII.GetString($header,0,6) -eq 'NINFER' -and $header[7] -eq 3){
+  $settings=Get-Settings;$settings.modelArtifact=$model.artifact;Write-Json $script:SettingsFile $settings
+  Write-Host 'Verified original artifact is already v3; reusing it without conversion or modification.'
+  return
+ }
+ if($header[7] -ne 2){throw 'Unsupported artifact version; original file was preserved.'}
+ $output=Join-Path $script:Models (Get-Settings).modelArtifact;$marker="$output.manager.json"
+ if(Test-Path $marker){$record=Read-Json $marker;if((Test-Path $output) -and (Get-FileHash $output).Hash.ToLowerInvariant() -eq $record.sha256 -and $record.upstreamCommit -eq $script:Lock.upstreamCommit){return};throw 'Upgraded model provenance changed. Preserve it before retrying.'}
+ if(Test-Path $output){throw 'An unverified migration output exists. Preserve it before retrying.'}
+ Sync-Upstream
+ Write-Host 'Upgrading into a separate v3 file; the original model is retained for rollback.'
+ Invoke-External docker @('run','--rm','--mount',"type=bind,source=$script:Models,target=/models",'--mount',"type=bind,source=$script:Source,target=/source,readonly",$script:Lock.python,'python','/source/tools/upgrade_ninfer_v2_to_v3.py',('/models/'+$model.artifact),('/models/'+(Get-Settings).modelArtifact))
+ Write-Json $marker @{upstreamCommit=$script:Lock.upstreamCommit;sourceSha256=$model.sha256;sha256=(Get-FileHash $output).Hash.ToLowerInvariant();bytes=(Get-Item $output).Length}
 }
 
-Assert-PowerShell7
-Initialize-State
-$mutexName='Global\NInferManager-'+([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($script:Root))).Substring(0,16))
-$script:Mutex=[Threading.Mutex]::new($false,$mutexName)
-if(-not$script:Mutex.WaitOne(0)){Write-Color 'Another instance of NInfer Manager is already running.' Red;exit 20}
-try {
-    switch($Action){
-        'Menu'{Show-Menu};'Install'{Invoke-Install};'Start'{Invoke-Start};'Stop'{Invoke-Stop};'Restart'{Invoke-Stop;Invoke-Start};'Status'{Show-Status};'CheckUpdates'{Invoke-CheckUpdates};'Update'{Invoke-Update};'Rebuild'{Invoke-Update -ForceBuild};
-        'Logs'{Invoke-Process docker @('logs','--tail','300',$script:ContainerName) -AllowFailure -Live|Out-Null};'Diagnostics'{Invoke-Diagnostics};'Repair'{Invoke-Repair};'ModelSettings'{Set-Model};'PerformanceSettings'{Set-Performance};'NetworkSettings'{Set-Network};
-        'ResetDefaults'{if($Yes-or(Confirm-Choice 'Reset settings to mandatory defaults?')){Write-JsonAtomic $script:SettingsPath (New-DefaultSettings)}};'ShowKey'{Show-Key};'RotateKey'{Rotate-Key};'Firewall'{Invoke-Firewall};'StressTest'{Invoke-StressTest};'SelfTest'{Invoke-SelfTest};'Uninstall'{Invoke-Uninstall}
-    }
-    exit 0
-} catch {
-    Write-Log ERROR $_.Exception.Message
-    if($Action-eq'Menu'){return}else{exit 1}
-} finally {
-    if($script:Mutex){try{$script:Mutex.ReleaseMutex()}catch{};$script:Mutex.Dispose()}
+function Write-Runtime {
+ $s=Get-Settings;$backend=[IO.File]::ReadAllText((Join-Path $script:State 'backend-secret.txt'))
+ if([int]$s.runtime.maxContext -ne 262144){throw 'The Hermes qwen profile requires a 262144-token backend. Do not change one side independently.'}
+ if($s.runtime.kvDtype -notin @('bf16','int8','fp8','nvfp4','k8v4') -or [int]$s.runtime.draftTokens -notin 1..5){throw 'Unsupported qwen KV or MTP settings.'}
+ $engine=@"
+[model]
+path = "/models/$($s.modelArtifact)"
+vision = false
+[engine]
+max_context = $($s.runtime.maxContext)
+kv_dtype = "$($s.runtime.kvDtype)"
+context_capacity = "auto"
+memory_headroom = "$($s.runtime.memoryHeadroom)"
+max_concurrency = 1
+max_pending_requests = 4
+pending_timeout = "1800s"
+prefill_chunk = 1024
+cuda_graph = true
+[context_cache]
+prefix_reuse = true
+checkpoint_interval = 8192
+host_capacity = "$($s.runtime.hostCapacity)"
+[speculative]
+backend = "mtp"
+draft_tokens = $($s.runtime.draftTokens)
+proposal_head = "optimized"
+[generation]
+max_tokens = 8192
+[server]
+host = "0.0.0.0"
+port = 8080
+api_key = "$backend"
+model_id = "qwen3.8-27b"
+cors = false
+[logging]
+level = "info"
+request_jsonl = ""
+"@
+ [IO.File]::WriteAllText((Join-Path $script:Runtime 'ninfer.toml'),$engine,[Text.UTF8Encoding]::new($false))
+ Write-Json (Join-Path $script:Runtime 'gateway.json') @{backendHost='ninfer';backendPort=8080;backendKey=$backend;backendTimeoutSeconds=1800;maxRequestBytes=16777216;qwen=(Get-Policy)}
+ $labels=@{'com.ninfer-manager.owner'=$script:Owner}
+ $services=[ordered]@{
+  ninfer=@{image=$script:EngineImage;container_name='ninfer';labels=@{'com.ninfer-manager.owner'=$script:Owner;'com.ninfer-manager.config-sha256'=(Get-Digest $engine)};gpus='all';restart='unless-stopped';command=@('ninfer-serve','--config','/run/manager/ninfer.toml');networks=@('backend');volumes=@(@{type='bind';source=$script:Models;target='/models';read_only=$true},@{type='bind';source=(Join-Path $script:Runtime 'ninfer.toml');target='/run/manager/ninfer.toml';read_only=$true},@{type='bind';source=(Join-Path $script:Root 'logs');target='/logs'})}
+  gateway=@{image=(Get-GatewayImage);container_name='ninfer-gateway';labels=$labels;restart='unless-stopped';read_only=$true;cap_drop=@('ALL');security_opt=@('no-new-privileges:true');networks=@('backend','edge');ports=@("127.0.0.1:$($s.network.localPort):8080");volumes=@(@{type='bind';source=$script:Runtime;target='/run/manager';read_only=$true});depends_on=@('ninfer')}
+ }
+ if($s.network.enabled){
+  $caddy=@"
+{
+    admin off
+    auto_https disable_redirects
+    default_sni $($s.network.hostname)
+}
+https://$($s.network.hostname):8443 {
+    tls internal
+    reverse_proxy gateway:8080
+}
+"@
+  [IO.File]::WriteAllText((Join-Path $script:Runtime 'Caddyfile'),$caddy,[Text.UTF8Encoding]::new($false))
+  $services.caddy=@{image=$script:Lock.caddy;container_name='ninfer-https';labels=@{'com.ninfer-manager.owner'=$script:Owner;'com.ninfer-manager.config-sha256'=(Get-Digest $caddy)};restart='unless-stopped';networks=@('edge');ports=@("$($s.network.address):$($s.network.httpsPort):8443");volumes=@(@{type='bind';source=(Join-Path $script:Runtime 'Caddyfile');target='/etc/caddy/Caddyfile';read_only=$true},'caddy-data:/data','caddy-config:/config')}
+ }
+ Write-Json $script:Compose @{name=$script:Project;services=$services;networks=@{backend=@{internal=$true};edge=@{}};volumes=@{'caddy-data'=@{};'caddy-config'=@{}}}
+}
+function Invoke-Api($Path,$Body=$null,[int]$Timeout=1800) {
+ $s=Get-Settings;$parameters=@{Uri="http://127.0.0.1:$($s.network.localPort)$Path";Headers=@{Authorization=('Bearer '+[IO.File]::ReadAllText((Join-Path $script:State 'admin-secret.txt')))};TimeoutSec=$Timeout}
+ if($null -ne $Body){$parameters.Method='POST';$parameters.ContentType='application/json';$parameters.Body=$Body|ConvertTo-Json -Depth 40 -Compress}
+ Invoke-RestMethod @parameters
+}
+function Test-Inference {
+ $models=Invoke-Api '/v1/models'
+ if($models.data[0].id -ne 'qwen3.8-27b'){throw 'Unexpected model ID.'}
+ $reply=Invoke-Api '/v1/chat/completions' @{model='qwen3.8-27b';messages=@(@{role='user';content='Reply with exactly READY.'});max_tokens=16;temperature=0;enable_thinking=$false}
+ if(-not $reply.choices[0].message.content){throw 'Inference returned no answer.'}
+ Write-Host 'PASS authenticated model discovery and inference.'
+}
+function Wait-Engine {
+ $deadline=[datetime]::UtcNow.AddMinutes(20)
+ while([datetime]::UtcNow -lt $deadline){
+  try{$health=Invoke-Api '/health' $null 5;if($health.status -eq 'ok'){return}}catch{}
+  $engine=Get-DockerJson @('inspect','ninfer')
+  if($engine -and $engine[0].State.Status -in @('exited','dead','restarting')){throw 'NInfer did not stay running. Run Logs; the old deployment remains available.'}
+  Start-Sleep -Seconds 3
+ }
+ throw 'Model startup timed out. Run Diagnostics.'
+}
+function Start-Stack {
+ if(-not(Test-Path (Join-Path $script:Models ((Get-Settings).modelArtifact)))){throw 'Upgraded model missing. Run Install.'}
+ foreach($container in @('ninfer','ninfer-gateway','ninfer-https')){Assert-Owned $container}
+ Build-Gateway
+ $legacy=Get-DockerJson @('inspect','ninfer-ext')
+ $legacyWasRunning=$legacy -and $legacy[0].State.Running
+ if($legacy){if($legacy[0].Config.Labels.'com.ninfer-manager.owner' -ne 'ninfer-ext-windows-manager-v1'){throw 'Existing ninfer-ext container has an unexpected owner.'};if($legacy[0].State.Running){Invoke-External docker @('stop','ninfer-ext')}}
+ $snapshot=$null
+ if(Test-Path (Join-Path $script:State 'deployment.json')){
+  $snapshot=Join-Path $script:State ('snapshots/'+(Get-Date -Format 'yyyyMMdd-HHmmss-ffff'))
+  [void][IO.Directory]::CreateDirectory($snapshot)
+  foreach($name in @('compose.json','ninfer.toml','gateway.json','Caddyfile')){if(Test-Path (Join-Path $script:Runtime $name)){Copy-Item -LiteralPath (Join-Path $script:Runtime $name) -Destination $snapshot}}
+ }
+ try{
+  Write-Runtime;Invoke-Compose @('up','-d','--remove-orphans');Wait-Engine;Test-Inference
+  Write-Json (Join-Path $script:State 'deployment.json') @{schemaVersion=2;upstreamCommit=$script:Lock.upstreamCommit;engineImage=$script:EngineImage;profile='qwen';startedUtc=[datetime]::UtcNow.ToString('o');legacyContainerPreserved=[bool]$legacy;configuredContext=262144}
+ }catch{
+  $failure=$_.Exception.Message
+  if($legacyWasRunning){try{Invoke-Compose @('stop');Invoke-External docker @('start','ninfer-ext')}catch{Write-Warning 'Automatic legacy recovery failed; stop the new stack, then docker start ninfer-ext.'}}
+  elseif($snapshot){try{Invoke-Compose @('stop');Get-ChildItem -LiteralPath $snapshot -File | ForEach-Object {Copy-Item -LiteralPath $_.FullName -Destination $script:Runtime -Force};Invoke-Compose @('up','-d','--remove-orphans')}catch{Write-Warning "Previous upstream runtime could not be restored automatically; snapshot: $snapshot"}}
+  throw "New deployment failed: $failure. Previous settings, image, and model were preserved."
+ }
+ Show-Status
+}
+function Install-Stack([switch]$Force) {
+ Test-Prerequisites;Build-Engine -Force:$Force;Install-Model
+ Start-Stack
+}
+function New-ClientKey([string]$Name,[int]$Days=0) {
+ $registry=Read-Json $script:KeysFile;$token=New-Token;$id=$Name+'-'+[Guid]::NewGuid().ToString('N').Substring(0,8)
+ $expiry=if($Days){[datetime]::UtcNow.AddDays($Days).ToString('o')}else{$null}
+ $registry.clients=@($registry.clients)+@([pscustomobject]@{id=$id;name=$Name;sha256=(Get-Digest $token);createdUtc=[datetime]::UtcNow.ToString('o');expiresUtc=$expiry;revokedUtc=$null})
+ Write-Json $script:KeysFile $registry
+ [pscustomobject]@{id=$id;token=$token;expiresUtc=$expiry}
+}
+function Revoke-ClientKey([string]$Id) {
+ if($Id -eq 'manager-local'){throw 'The manager-local credential cannot be revoked through client actions.'}
+ $registry=Read-Json $script:KeysFile;$entry=@($registry.clients | Where-Object id -eq $Id)
+ if($entry.Count -ne 1){throw 'Specify an existing client KeyId (ListKeys).'}
+ $entry[0].revokedUtc=[datetime]::UtcNow.ToString('o');Write-Json $script:KeysFile $registry
+ Write-Host "Revoked $Id. New requests are rejected immediately; active streams may finish."
+}
+function Export-Certificate([string]$Destination) {
+ if(-not (Get-Settings).network.enabled){throw 'EnableLan first to issue the certificate.'}
+ if(-not $Destination){$Destination=Join-Path $script:State 'ninfer-root-ca.crt'}
+ Invoke-External docker @('cp','ninfer-https:/data/caddy/pki/authorities/local/root.crt',$Destination)
+ $certificate=[Security.Cryptography.X509Certificates.X509Certificate2]::new($Destination)
+ Write-Host "Public root certificate: $Destination"
+ Write-Host "SHA256 fingerprint: $($certificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256))"
+}
+function Get-HermesCommand { (Get-Command hermes -ErrorAction Stop).Source }
+function Export-Hermes {
+ $s=Get-Settings
+ if(-not $s.network.enabled){throw 'EnableLan first. The Hermes connection requires HTTPS.'}
+ $destination=if($OutputDirectory){[IO.Path]::GetFullPath($OutputDirectory)}else{Join-Path $env:LOCALAPPDATA 'hermes'}
+ if(-not(Test-Path (Join-Path $destination 'config.yaml') -PathType Leaf)){throw 'Install Hermes and finish its default setup first. ExportHermes adds a model to that existing setup.'}
+ $hermes=Get-HermesCommand
+ $backup=Join-Path $script:State ('hermes-backups/'+(Get-Date -Format 'yyyyMMdd-HHmmss-ffff'))
+ [void][IO.Directory]::CreateDirectory($backup);Protect-Directory $backup
+ $tracked=@('config.yaml','.env','ninfer-client-key-id.txt','certs/ninfer-root-ca.crt')
+ $existed=@{}
+ foreach($name in $tracked){
+  $original=Join-Path $destination $name;$existed[$name]=Test-Path -LiteralPath $original
+  if($existed[$name]){$saved=Join-Path $backup $name;[void][IO.Directory]::CreateDirectory((Split-Path $saved));Copy-Item -LiteralPath $original -Destination $saved}
+ }
+ $envFile=Join-Path $destination '.env';$key=$null;$previousHome=$env:HERMES_HOME
+ try {
+  $certs=Join-Path $destination 'certs';[void][IO.Directory]::CreateDirectory($certs)
+  $ca=Join-Path $certs 'ninfer-root-ca.crt';Export-Certificate $ca
+  $key=New-ClientKey $ClientName $ExpiresDays
+  $url="https://$($s.network.hostname):$($s.network.httpsPort)/v1"
+  $provider=@{extra_body=@{enable_thinking=$false};name='Qwen (NInfer)';base_url=$url;api_mode='chat_completions';model='qwen3.8-27b';discover_models=$false;models=@{'qwen3.8-27b'=@{context_length=262144}};context_length=262144;key_env='HERMES_CUSTOM_QWEN_API_KEY';ssl_ca_cert=$ca.Replace('\','/');ssl_verify=$true}
+  $oldEnvironment=if($existed['.env']){[IO.File]::ReadAllText($envFile)}else{[IO.File]::WriteAllText($envFile,'');''}
+  $keptEnvironment=@($oldEnvironment -split '\r?\n' | Where-Object {$_ -notmatch '^\s*HERMES_CUSTOM_QWEN_API_KEY='})
+  $updatedEnvironment=($keptEnvironment -join "`n").TrimEnd("`r","`n")+"`nHERMES_CUSTOM_QWEN_API_KEY=$($key.token)`n"
+  Protect-SecretFile $envFile
+  [IO.File]::WriteAllText($envFile,$updatedEnvironment,[Text.UTF8Encoding]::new($false))
+  $env:HERMES_HOME=$destination
+  Invoke-External $hermes @('--profile','default','config','set','providers.qwen',($provider|ConvertTo-Json -Depth 8 -Compress))
+  Invoke-External $hermes @('--profile','default','config','set','compression.model_thresholds.qwen','0.75')
+  Invoke-External $hermes @('--profile','default','config','set','auxiliary.compression.provider','main')
+  Invoke-External $hermes @('--profile','default','config','set','auxiliary.compression.model','""')
+  Invoke-External $hermes @('--profile','default','config','set','auxiliary.compression.base_url','""')
+  Invoke-External $hermes @('--profile','default','config','set','auxiliary.compression.extra_body','{}')
+  Invoke-External $hermes @('--profile','default','config','set','model.persist_switch_by_default','false')
+  [IO.File]::WriteAllText((Join-Path $destination 'ninfer-client-key-id.txt'),$key.id)
+ }catch {
+  $failure=$_
+  foreach($name in $tracked){
+   try {
+    if($existed[$name]){Copy-Item -LiteralPath (Join-Path $backup $name) -Destination (Join-Path $destination $name) -Force}
+    elseif(Test-Path -LiteralPath (Join-Path $destination $name)){Remove-Item -LiteralPath (Join-Path $destination $name)}
+   }catch{Write-Warning "Restore $name manually from $backup; automatic restoration failed."}
+  }
+  if($key){try{Revoke-ClientKey $key.id}catch{Write-Warning "Revoke the failed setup's key $($key.id) manually."}}
+  throw $failure
+ }finally{$env:HERMES_HOME=$previousHome}
+ Write-Host "Qwen added to the existing Hermes model picker. The default model is unchanged. Backup: $backup"
+}
+function Enable-Lan {
+ if(-not $LanAddress -or -not $TrustedRemoteAddress){throw 'Supply -LanAddress <this PC IPv4> and -TrustedRemoteAddress <trusted IPv4/CIDR>.'}
+ $address=[Net.IPAddress]::Parse($LanAddress)
+ if($address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or $LanAddress -in @('0.0.0.0','127.0.0.1')){throw 'Use a specific LAN IPv4 address.'}
+ if(-not(Get-NetIPAddress -AddressFamily IPv4 | Where-Object IPAddress -eq $LanAddress)){throw 'LanAddress is not assigned to this computer.'}
+ if($TrustedRemoteAddress -notmatch '^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$'){throw 'Use a narrow trusted IPv4 address or subnet.'}
+ $null=[Net.IPAddress]::Parse(($TrustedRemoteAddress -split '/')[0])
+ if($TrustedRemoteAddress.Contains('/') -and [int]($TrustedRemoteAddress -split '/')[1] -notin 8..32){throw 'Trusted prefix must be between 8 and 32.'}
+ $name=if($HostName){$HostName}else{$LanAddress};if($name -notmatch '^[a-zA-Z0-9.-]+$'){throw 'Hostname must be a DNS name or IPv4 address.'}
+ $previous=Get-Settings
+ $s=Get-Settings;$s.network.enabled=$true;$s.network.address=$LanAddress;$s.network.hostname=$name;$s.network.trustedSubnet=$TrustedRemoteAddress
+ $firewallApplied=$false
+ try {
+  Set-ManagedFirewall $s;$firewallApplied=$true
+  Write-Json $script:SettingsFile $s;Start-Stack
+ }catch {
+  $failure=$_
+  Write-Json $script:SettingsFile $previous
+  if($firewallApplied){
+   try{if($previous.network.enabled){Set-ManagedFirewall $previous}else{Set-ManagedFirewall $s -Remove}}
+   catch{Write-Warning 'The previous firewall scope could not be restored; inspect the owned HTTPS rule before enabling LAN again.'}
+  }
+  throw $failure
+ }
+ Export-Certificate ''
+}
+function Set-ManagedFirewall($Settings,[switch]$Remove) {
+ $result=Join-Path $script:State 'firewall-result.json'
+ if(Test-Path $result){Remove-Item -LiteralPath $result}
+ $helper=Join-Path $script:Root 'deployment/configure-firewall.ps1'
+ if(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
+  & $helper -Address $Settings.network.address -TrustedSubnet $Settings.network.trustedSubnet -Port $Settings.network.httpsPort -ResultFile $result -Remove:$Remove
+ } else {
+  Write-Host 'Windows needs one-time Administrator approval for the narrowly scoped HTTPS firewall rule.'
+  $arguments=@('-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+$helper+'"'),'-Address',$Settings.network.address,'-TrustedSubnet',$Settings.network.trustedSubnet,'-Port',[string]$Settings.network.httpsPort,'-ResultFile',('"'+$result+'"'))
+  if($Remove){$arguments+='-Remove'}
+  $process=Start-Process -FilePath (Get-Command pwsh.exe).Source -Verb RunAs -WindowStyle Hidden -ArgumentList $arguments -Wait -PassThru
+  if($process.ExitCode -ne 0){throw 'Firewall configuration failed or Administrator approval was declined. LAN settings were not applied.'}
+ }
+ if(-not(Test-Path $result) -or -not(Read-Json $result).ok){throw 'Could not confirm the restricted firewall rule. LAN settings were not applied.'}
+}
+function Show-Status {
+ $s=Get-Settings
+ Write-Host "NInfer Windows Manager | upstream $($script:Lock.upstreamCommit.Substring(0,12)) | Hermes qwen"
+ Write-Host "Local API: http://127.0.0.1:$($s.network.localPort)/v1 (API key required)"
+ if($s.network.enabled){Write-Host "LAN API: https://$($s.network.hostname):$($s.network.httpsPort)/v1 | trusted subnet $($s.network.trustedSubnet)"}
+ Write-Host 'Context: configured 262144; Hermes compaction at 75%; output default 8192.'
+ if(Test-Path (Join-Path $script:State 'validation.json')){$validation=Read-Json (Join-Path $script:State 'validation.json');$validation.profile='qwen';$validation|ConvertTo-Json -Depth 8}
+ Write-Host 'Client credentials: CreateKey / ExportHermes; keys are never printed by Status.'
+ & docker ps -a --filter "label=com.ninfer-manager.owner=$script:Owner" --format '{{.Names}} | {{.Status}} | {{.Ports}}'
+}
+function Invoke-Benchmark {
+ $results=@()
+ foreach($text in $BenchmarkContexts.Split(',')){
+  $target=[int]$text;if($target -lt 128 -or $target+$BenchmarkOutputTokens+256 -gt 262144){throw 'Benchmark context leaves insufficient output/template headroom.'}
+  for($run=1;$run -le $BenchmarkRuns;$run++){
+   $prompt='Qwen benchmark nonce '+[Guid]::NewGuid().ToString('N')+"`n"+('data ' * $target)+"`nWrite a detailed numbered qwen checklist. Continue until the output limit."
+   $watch=[Diagnostics.Stopwatch]::StartNew()
+   $response=Invoke-Api '/v1/chat/completions' @{model='qwen3.8-27b';messages=@(@{role='user';content=$prompt});max_tokens=$BenchmarkOutputTokens;enable_thinking=$false;temperature=0}
+   $watch.Stop();$timings=if($response.PSObject.Properties.Name -contains 'timings'){$response.timings}else{$null}
+   $results+=@{target=$target;run=$run;promptTokens=$response.usage.prompt_tokens;completionTokens=$response.usage.completion_tokens;elapsedSeconds=$watch.Elapsed.TotalSeconds;timings=$timings}
+   Write-Host "PASS target $target; actual prompt $($response.usage.prompt_tokens), output $($response.usage.completion_tokens), $([math]::Round($watch.Elapsed.TotalSeconds,2)) seconds"
+  }
+ }
+ $path=Join-Path $script:Root ('logs/benchmark-upstream-'+(Get-Date -Format 'yyyyMMdd-HHmmss')+'.json')
+ Write-Json $path @{upstreamCommit=$script:Lock.upstreamCommit;settings=(Get-Settings).runtime;results=$results;createdUtc=[datetime]::UtcNow.ToString('o')}
+ $maximum=($results | ForEach-Object promptTokens | Measure-Object -Maximum).Maximum
+ Write-Json (Join-Path $script:State 'validation.json') @{configuredContext=262144;largestValidatedInput=$maximum;outputBudgetTokens=$BenchmarkOutputTokens;report=$path;profile='qwen';upstreamCommit=$script:Lock.upstreamCommit}
+}
+function Invoke-Rollback {
+ $old=Get-DockerJson @('inspect','ninfer-ext')
+ if(-not $old -or $old[0].Config.Labels.'com.ninfer-manager.owner' -ne 'ninfer-ext-windows-manager-v1'){throw 'No owned legacy container exists. See docs/migration.md.'}
+ if(Test-Path $script:Compose){Invoke-Compose @('stop')};Invoke-External docker @('start','ninfer-ext')
+ Write-Host 'Legacy NInfer-Ext restored with original credentials/network settings. New key revocations remain intact.'
+}
+function Test-LegacyRollback {
+ $legacy=Get-DockerJson @('inspect','ninfer-ext')
+ if(-not $legacy -or $legacy[0].Config.Labels.'com.ninfer-manager.owner' -ne 'ninfer-ext-windows-manager-v1'){throw 'No owned legacy deployment is available to test.'}
+ if(Get-DockerJson @('inspect','ninfer-rollback-check')){throw 'The rollback-check container name is already in use.'}
+ $modelMount=@($legacy[0].Mounts | Where-Object Destination -eq '/models')
+ if($modelMount.Count -ne 1){throw 'Legacy model mount is ambiguous.'}
+ $cleanArguments=[Collections.Generic.List[string]]::new()
+ $oldArguments=@($legacy[0].Config.Cmd)
+ for($i=0;$i -lt $oldArguments.Count;$i++){if($oldArguments[$i] -eq '--api-key'){$i++;continue};$cleanArguments.Add([string]$oldArguments[$i])}
+ $created=$false;$passed=$false
+ try {
+  Invoke-Compose @('stop')
+  Invoke-External docker (@('run','--detach','--name','ninfer-rollback-check','--label','com.ninfer-manager.owner=ninfer-windows-manager-test','--gpus','all','--network',($script:Project+'_backend'),'--mount',"type=bind,source=$($modelMount[0].Source),target=/models,readonly",$legacy[0].Config.Image)+$cleanArguments.ToArray())
+  $created=$true
+  $probe=@'
+import json,time,urllib.request
+url='http://ninfer-rollback-check:8080'
+for attempt in range(240):
+    try:
+        with urllib.request.urlopen(url+'/health',timeout=5) as r:
+            if json.load(r).get('status')=='ok': break
+    except Exception: time.sleep(2)
+else: raise RuntimeError('Legacy readiness timeout')
+body=json.dumps({'model':'qwen3.8-27b','messages':[{'role':'user','content':'Reply with exactly READY.'}],'max_tokens':16,'temperature':0,'enable_thinking':False}).encode()
+with urllib.request.urlopen(urllib.request.Request(url+'/v1/chat/completions',body,{'Content-Type':'application/json'}),timeout=180) as r:
+    reply=json.load(r)
+    assert reply['choices'][0]['message']['content']
+print('PASS preserved legacy image, original model mount, and original runtime options: inference succeeded on an unpublished private-network probe.')
+'@
+  Invoke-External docker @('run','--rm','--network',($script:Project+'_backend'),$script:Lock.python,'python','-c',$probe)
+  $passed=$true
+ } finally {
+  if($created){Invoke-External docker @('rm','--force','ninfer-rollback-check')}
+  Start-Stack
+ }
+ if($passed){Write-Json (Join-Path $script:Root 'logs/rollback-validation.json') @{legacyImage=$legacy[0].Config.Image;originalModelMount=$modelMount[0].Source;legacyInference=$true;upstreamRestored=$true;scope='Unpublished probe using preserved legacy image/model/options. Original container and its network bindings were not changed or exposed.';createdUtc=[datetime]::UtcNow.ToString('o')}}
+}
+function Invoke-SelfTest {
+ Invoke-External python @('-m','unittest','discover','-s',(Join-Path $script:Root 'tests'),'-v')
+ Invoke-External pwsh @('-NoProfile','-File',(Join-Path $script:Root 'tests/manager.ps1'))
+ Invoke-External pwsh @('-NoProfile','-File',(Join-Path $script:Root 'tests/recovery.ps1'))
+}
+function Show-Menu {
+ while($true){
+  Write-Host "`nNInfer Windows Manager`n1 Install / Start   2 Status   3 Stop   4 Restart`n5 Export Hermes   6 List keys   7 Diagnostics   8 Rollback   0 Exit"
+  switch(Read-Host 'Select'){'1'{Install-Stack};'2'{Show-Status};'3'{Invoke-Compose @('stop')};'4'{Invoke-Compose @('stop');Start-Stack};'5'{Export-Hermes};'6'{(Read-Json $script:KeysFile).clients | Select-Object id,name,createdUtc,expiresUtc,revokedUtc | Format-Table};'7'{Show-Status;Invoke-Compose @('logs','--tail','50')};'8'{Invoke-Rollback};'0'{return}}
+ }
+}
+function Invoke-Main {
+ Initialize-Manager
+ switch($Action){
+  'Menu'{if($NonInteractive){throw 'Choose an explicit Action for non-interactive use.'};Show-Menu}
+  'Install'{Install-Stack};'Start'{if(-not(Test-Path $script:Compose)){Install-Stack}else{Start-Stack}}
+  'Stop'{Invoke-Compose @('stop')};'Restart'{Invoke-Compose @('stop');Start-Stack};'Status'{Show-Status}
+  'CheckUpdates'{Write-Host "Tested pin: $($script:Lock.upstreamCommit)";Invoke-External git @('ls-remote',$script:Lock.upstreamUrl,'HEAD');Write-Host 'Update applies the checked-in lock file; upstream HEAD is informational.'}
+  'Update'{Install-Stack};'Rebuild'{Install-Stack -Force};'Repair'{Install-Stack}
+  'Logs'{Invoke-Compose @('logs','--tail','100','--follow')}
+  'Diagnostics'{Show-Status;Invoke-Compose @('config','--quiet');Invoke-Compose @('logs','--tail','70');Test-Inference}
+  'EnableLan'{Enable-Lan}
+  'DisableLan'{$s=Get-Settings;if($s.network.address){Set-ManagedFirewall $s -Remove};$s.network.enabled=$false;Write-Json $script:SettingsFile $s;Start-Stack}
+  'CreateKey'{$created=New-ClientKey $ClientName $ExpiresDays;Write-Host "Key ID: $($created.id)`nAPI key (shown once): $($created.token)"}
+  'ListKeys'{(Read-Json $script:KeysFile).clients | Select-Object id,name,createdUtc,expiresUtc,revokedUtc | Format-Table}
+  'RevokeKey'{Revoke-ClientKey $KeyId}
+  'RotateKey'{if(-not $KeyId){throw 'Specify the old -KeyId. Update your client before revoking it.'};$existing=@((Read-Json $script:KeysFile).clients | Where-Object id -eq $KeyId);if($existing.Count -ne 1 -or $KeyId -eq 'manager-local'){throw 'Select an existing client key.'};$created=New-ClientKey $existing[0].name $ExpiresDays;Write-Host "Replacement ID: $($created.id)`nAPI key (shown once): $($created.token)`nOld key remains valid until RevokeKey -KeyId $KeyId."}
+  'ExportHermes'{Export-Hermes};'ExportCertificate'{Export-Certificate ''}
+  'TrustCertificate'{Export-Certificate '';Import-Certificate -FilePath (Join-Path $script:State 'ninfer-root-ca.crt') -CertStoreLocation Cert:\CurrentUser\Root | Select-Object Subject,Thumbprint}
+  'Benchmark'{Invoke-Benchmark};'ValidateQwen'{Test-Inference;Invoke-Benchmark;Write-Host 'Also run the Hermes multi-compaction acceptance test (docs/hermes-qwen.md).'}
+  'SelfTest'{Invoke-SelfTest};'Rollback'{Invoke-Rollback}
+  'VerifyRollback'{Test-LegacyRollback}
+  'Uninstall'{if(-not $Yes){throw 'Use -Yes to remove only the managed stack. Models, legacy setup, certificates, and settings are retained.'};foreach($c in @('ninfer','ninfer-gateway','ninfer-https')){Assert-Owned $c};Invoke-Compose @('down');$s=Get-Settings;if($s.network.address){Set-ManagedFirewall $s -Remove}}
+ }
+}
+if($MyInvocation.InvocationName -ne '.') {
+ $managerLock=$null
+ try {
+  [void][IO.Directory]::CreateDirectory($script:State)
+  try{$managerLock=[IO.File]::Open((Join-Path $script:State 'manager.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch [IO.IOException]{throw 'Another manager action is running. Wait for it to finish, then retry.'}
+  Invoke-Main
+ } catch { Write-Error $_; exit 1 } finally { if($managerLock){$managerLock.Dispose()} }
 }

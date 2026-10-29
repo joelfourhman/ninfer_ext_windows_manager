@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "upstreamUrl": "https://github.com/Neroued/ninfer.git",
+  "upstreamCommit": "1882c6adbc98043fcf89f3589aa5addb3742777a",
+  "cudaBuild": "nvidia/cuda:13.3.1-devel-ubuntu26.04@sha256:0ee41c7eac41d2579b268be60db1012ad23b0d4f3222b76566128fe28881a8f8",
+  "cudaRuntime": "nvidia/cuda:13.3.1-runtime-ubuntu26.04@sha256:b9321b748007329ae6a63261eb041612d18b802e23a485717cfa3584d640dd57",
+  "python": "python:3.11.14-slim-bookworm@sha256:83f339c1be6340ae1096010fdccf6552ac932d8f410d45d206014916bdf37e48",
+  "caddy": "caddy:2.11.2-alpine@sha256:6d125e80883be8a2bef5f088c7535945b42cdbb8a0f5471bf36eaf18dc0638f1",
+  "model": {
+    "repository": "neroued/Qwen3.8-27B-nvfp4-NInfer",
+    "revision": "a107ba1b5b0609d9ca90d5ed61439f5f5cc7d64d",
+    "artifact": "qwen3_8_27b_nvfp4.ninfer",
+    "bytes": 23719715844,
+    "sha256": "74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82",
+    "modelId": "qwen3.8-27b"
+  }
+}

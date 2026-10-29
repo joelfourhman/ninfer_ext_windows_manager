@@ -4,6 +4,9 @@ logs/
 models/
 source/
 temp/
+__pycache__/
+*.pyc
+.pytest_cache/
 
 # PowerShell and editor artifacts
 *.log
@@ -15,3 +18,11 @@ temp/
 # Windows metadata
 Thumbs.db
 Desktop.ini
+
+# Credentials must remain local even outside generated state folders
+.env
+.env.*
+!.env.example
+*.key
+*.pfx
+*.p12

@@ -1,0 +1,31 @@
+name: Manager checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: HTTP boundary behavior
+        run: python -m unittest discover -s tests -v
+      - name: Manager runtime generation and key lifecycle
+        shell: pwsh
+        run: |
+          ./tests/manager.ps1
+          ./tests/recovery.ps1
+      - name: Compile Python tooling
+        run: python -m py_compile gateway/server.py tools/validate_live.py tools/validate_hermes.py
+      - name: Check whitespace
+        run: git diff --check

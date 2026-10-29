@@ -1,0 +1,7 @@
+ARG PYTHON_IMAGE
+FROM ${PYTHON_IMAGE}
+WORKDIR /app
+COPY gateway/server.py /app/server.py
+USER 65532:65532
+EXPOSE 8080
+CMD ["python", "-u", "/app/server.py", "--config", "/run/manager/gateway.json", "--keys", "/run/manager/clients.json"]
